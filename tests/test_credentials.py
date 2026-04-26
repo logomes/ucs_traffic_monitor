@@ -1,5 +1,4 @@
 import pytest
-
 from credentials import Domain, load_domains_from_env
 
 
@@ -87,3 +86,15 @@ def test_whitespace_in_utm_domains_is_tolerated(monkeypatch):
     domains = load_domains_from_env()
 
     assert [d.id for d in domains] == ["dom1", "dom2", "dom3"]
+
+
+def test_group_defaults_to_default_when_unset(monkeypatch):
+    monkeypatch.setenv("UTM_DOMAINS", "dom1")
+    monkeypatch.setenv("UTM_dom1_HOST", "10.0.0.10")
+    monkeypatch.setenv("UTM_dom1_USER", "u")
+    monkeypatch.setenv("UTM_dom1_PASS", "p")
+    monkeypatch.delenv("UTM_dom1_GROUP", raising=False)
+
+    domains = load_domains_from_env()
+
+    assert domains[0].group == "default"
