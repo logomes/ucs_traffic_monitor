@@ -250,26 +250,40 @@ docker compose up -d --build     # ressuscita do zero
 
 **Este é o tarball atual, com TUDO consolidado** (credentials refactor + dashboards Grafana 12 + operator scripts + auto-rollback).
 
-**Tarball:** `~/utm-prod-deploy-952017c.tar.gz` (132 KB)
+**Tarball:** `~/utm-prod-deploy-952017c.tar.gz` (132 KB) — alternativa via scp
 
-### 1. Copiar pra VM
+### Caminho recomendado: clone direto do GitHub na VM
 
-```fish
-scp ~/utm-prod-deploy-952017c.tar.gz seu-usuario@ip-da-vm:/tmp/
-```
-
-### 2. Na VM — dry-run primeiro (ver o que SERIA feito)
+Comando único pra colar na VM (instala git/jq se faltar, clona, builda tarball, extrai, dry-run):
 
 ```sh
-cd /tmp
-mkdir -p utm-deploy && tar xzf utm-prod-deploy-952017c.tar.gz -C utm-deploy
-cd utm-deploy
-sudo ./install.sh --dry-run 2>&1 | less
+sudo zypper install -y git jq && \
+cd /tmp && \
+git clone https://github.com/logomes/ucs_traffic_monitor.git && \
+cd ucs_traffic_monitor && \
+git checkout feat/prod-rollout-grafana-12 && \
+./deploy/pack.sh /tmp && \
+mkdir -p /tmp/utm-deploy && \
+tar xzf /tmp/utm-prod-deploy-*.tar.gz -C /tmp/utm-deploy && \
+cd /tmp/utm-deploy && \
+sudo ./install.sh --dry-run 2>&1 | tee /tmp/utm-dryrun.log
 ```
 
-Inspecione a saída — confirma os paths (`UTM_DIR`, `TELEGRAF_CONF_PATH`) e plano de execução.
+Inspecione `/tmp/utm-dryrun.log` antes de rodar pra valer.
 
-### 3. Na VM — execução real
+### Alternativa: scp do laptop (se tiver acesso direto)
+
+```fish
+scp ~/utm-prod-deploy-952017c.tar.gz user@vm:/tmp/
+```
+
+Na VM:
+```sh
+cd /tmp && mkdir -p utm-deploy && tar xzf utm-prod-deploy-*.tar.gz -C utm-deploy
+cd utm-deploy && sudo ./install.sh --dry-run | less
+```
+
+### Execução real (após validar dry-run)
 
 ```sh
 sudo ./install.sh
