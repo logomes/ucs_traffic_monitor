@@ -42,3 +42,19 @@ def test_exits_when_utm_domains_empty_string(monkeypatch, capsys):
 
     assert exc_info.value.code == 2
     assert "UTM_DOMAINS" in capsys.readouterr().err
+
+
+def test_exits_when_per_domain_vars_missing(monkeypatch, capsys):
+    monkeypatch.setenv("UTM_DOMAINS", "dom1")
+    monkeypatch.setenv("UTM_dom1_HOST", "10.0.0.10")
+    monkeypatch.setenv("UTM_dom1_USER", "monitoring")
+    monkeypatch.delenv("UTM_dom1_PASS", raising=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_domains_from_env()
+
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "UTM_dom1_PASS" in err
+    assert "UTM_dom1_HOST" not in err
+    assert "UTM_dom1_USER" not in err
