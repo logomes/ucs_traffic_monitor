@@ -71,24 +71,76 @@ You are responsible to upgrade Grafana, InfluxDB, Telegraf, Python and other pac
 
 ## Configuration
 
-[ucs_traffic_monitor.py](https://github.com/paregupt/ucs_traffic_monitor/blob/master/telegraf/ucs_traffic_monitor.py "ucs_traffic_monitor.py") fetches metrics from Cisco UCS and stitches them. This file is invoked by telegraf exec input plugin every 60 seconds. Login credentials of UCS should be available in ucs_domains_group*.txt.
+UCS Traffic Monitor reads credentials from environment variables (no
+plaintext file is read at runtime).
 
-Try 
-```shell
-$ python3 /usr/local/telegraf/ucs_traffic_monitor.py -h
+### Required environment variables
+
+```sh
+# Comma-separated list of logical domain ids
+UTM_DOMAINS=dom1,dom2
+
+# Per-domain credentials
+UTM_dom1_HOST=10.0.0.10
+UTM_dom1_USER=monitoring
+UTM_dom1_PASS=secret-password
+
+# Optional grouping label (default: "default")
+UTM_dom1_GROUP=production
 ```
-if you are running this for the first time.
 
-Change/Add to your telegraf.conf file as below
+### Recommended deployment
 
-```shell
+Place credentials in `/etc/utm/creds.env`:
+
+```sh
+sudo install -d -m 0700 -o telegraf -g telegraf /etc/utm
+sudo install -m 0600 -o telegraf -g telegraf /dev/null /etc/utm/creds.env
+sudo $EDITOR /etc/utm/creds.env
+```
+
+Use the provided `systemd/utm.service.example` and reference the env
+file with `EnvironmentFile=/etc/utm/creds.env`.
+
+For multi-instance deployments (previously `ucs_domains_group_1.txt` and
+`ucs_domains_group_2.txt`), pass `--instance-name <name>` to keep log
+files and pickle caches separate per instance.
+
+### Telegraf exec input
+
+```toml
 [[inputs.exec]]
    interval = "60s"
    commands = [
-       "python3 /usr/local/telegraf/ucs_traffic_monitor.py /usr/local/telegraf/ucs_domains.txt influxdb-lp -vv",
+       "python3 /usr/local/telegraf/ucs_traffic_monitor.py influxdb-lp --instance-name utm -vv",
    ]
    timeout = "50s"
    data_format = "influx"
+```
+
+When telegraf invokes the script, it inherits the environment from
+its systemd unit. Add `EnvironmentFile=/etc/utm/creds.env` to the
+telegraf systemd drop-in (or use a wrapper systemd service that
+exports the vars before exec'ing telegraf).
+
+### Migrating existing deployments
+
+If you already have `ucs_domains_group_*.txt` files, use the migration
+helper:
+
+```sh
+sudo python3 scripts/migrate_credentials.py \
+    --input /etc/telegraf/ucs_domains_group_1.txt \
+    --output /etc/utm/creds.env
+sudo chown telegraf:telegraf /etc/utm/creds.env
+sudo chmod 600 /etc/utm/creds.env
+```
+
+After validating the new deployment runs cleanly for 24-48h, securely
+delete the legacy file:
+
+```sh
+sudo shred -u /etc/telegraf/ucs_domains_group_1.txt
 ```
 
 also update the global values like
