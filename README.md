@@ -143,6 +143,37 @@ delete the legacy file:
 sudo shred -u /etc/telegraf/ucs_domains_group_1.txt
 ```
 
+### Customizing upgrade_utm.sh
+
+The upgrade script's package versions are parametrizable via env vars.
+To upgrade to a different Grafana or Telegraf version, override the
+version and supply the matching SHA256.
+
+For Grafana, the SHA256 is published alongside each RPM:
+
+```sh
+GRAFANA_SHA=$(curl -fsSL https://dl.grafana.com/oss/release/grafana-7.5.7-1.x86_64.rpm.sha256 | head -1)
+```
+
+For Telegraf, InfluxData publishes a PGP signature (`.asc`) but not a
+`.sha256` file. Compute it from the RPM directly:
+
+```sh
+TELEGRAF_SHA=$(curl -fsSL -o /tmp/t.rpm https://dl.influxdata.com/telegraf/releases/telegraf-1.18.3-1.x86_64.rpm \
+    && sha256sum /tmp/t.rpm | awk '{print $1}' && rm /tmp/t.rpm)
+```
+
+Then run:
+
+```sh
+GRAFANA_VERSION=7.5.7 GRAFANA_RPM_SHA256="$GRAFANA_SHA" \
+TELEGRAF_VERSION=1.18.3 TELEGRAF_RPM_SHA256="$TELEGRAF_SHA" \
+./upgrade_utm.sh
+```
+
+The script verifies SHA256 before installing — a mismatch aborts the
+upgrade with the offending hash printed.
+
 also update the global values like
 
 ```shell
