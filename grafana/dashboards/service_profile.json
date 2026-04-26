@@ -21,6 +21,22 @@
   "links": [],
   "panels": [
     {
+      "id": 999,
+      "type": "text",
+      "title": "Migration notice",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "> \u26a0\ufe0f **Migration in progress.** Os pain\u00e9is de topologia visual deste dashboard ainda usam o plugin `agenty-flowcharting-panel` (Angular), que Grafana 11+ n\u00e3o carrega. Os pain\u00e9is nativos abaixo (gr\u00e1ficos, s\u00e9ries temporais, tabelas) funcionam normalmente. Migra\u00e7\u00e3o planejada \u2014 ver [`docs/superpowers/specs/2026-04-26-grafana-12-modernization-design.md`](.)."
+      },
+      "datasource": null
+    },
+    {
       "datasource": "$data_source",
       "description": "![Cisco UCS Architecture](/public/img/utm/ucs_architecture.png)\nUTM collector - v$utm_collector_ver  \nUTM GUI - v0.52  \nby Paresh Gupta",
       "fieldConfig": {
@@ -31,7 +47,7 @@
         "h": 3,
         "w": 24,
         "x": 0,
-        "y": 0
+        "y": 3
       },
       "id": 23763571993,
       "options": {
@@ -116,7 +132,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 3
+        "y": 6
       },
       "id": 23763571999,
       "newFlag": false,
@@ -535,7 +551,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 8
       },
       "id": 5,
       "options": {
@@ -592,7 +608,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 7
+        "y": 10
       },
       "id": 22,
       "panels": [],
@@ -625,7 +641,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 8
+        "y": 11
       },
       "id": 547,
       "options": {
@@ -738,7 +754,7 @@
         "h": 6,
         "w": 3,
         "x": 0,
-        "y": 9
+        "y": 12
       },
       "id": 4,
       "interval": "[[polling_interval]]s",
@@ -908,7 +924,7 @@
         "h": 6,
         "w": 4,
         "x": 3,
-        "y": 9
+        "y": 12
       },
       "id": 23763571994,
       "interval": "[[polling_interval]]s",
@@ -1170,7 +1186,7 @@
         "h": 6,
         "w": 5,
         "x": 7,
-        "y": 9
+        "y": 12
       },
       "id": 545,
       "interval": "[[polling_interval]]s",
@@ -2514,7 +2530,7 @@
         "h": 6,
         "w": 2,
         "x": 12,
-        "y": 9
+        "y": 12
       },
       "id": 23763571997,
       "interval": "[[polling_interval]]s",
@@ -2639,7 +2655,7 @@
         "h": 6,
         "w": 4,
         "x": 14,
-        "y": 9
+        "y": 12
       },
       "hiddenSeries": false,
       "id": 23763572001,
@@ -2812,7 +2828,7 @@
         "h": 6,
         "w": 2,
         "x": 18,
-        "y": 9
+        "y": 12
       },
       "id": 23763571995,
       "interval": "[[polling_interval]]s",
@@ -2937,7 +2953,7 @@
         "h": 6,
         "w": 4,
         "x": 20,
-        "y": 9
+        "y": 12
       },
       "hiddenSeries": false,
       "id": 23763572000,
@@ -3096,7 +3112,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 18
       },
       "id": 26,
       "panels": [
@@ -5288,7 +5304,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 16
+        "y": 19
       },
       "id": 71,
       "panels": [
@@ -6257,7 +6273,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 20
       },
       "id": 96,
       "panels": [
@@ -8713,7 +8729,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 21
       },
       "id": 200,
       "panels": [
@@ -9562,7 +9578,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 19
+        "y": 22
       },
       "id": 230,
       "panels": [
@@ -19102,7 +19118,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 23
       },
       "id": 288,
       "panels": [

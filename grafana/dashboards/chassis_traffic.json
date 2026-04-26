@@ -22,6 +22,22 @@
   "links": [],
   "panels": [
     {
+      "id": 999,
+      "type": "text",
+      "title": "Migration notice",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "> \u26a0\ufe0f **Migration in progress.** Os pain\u00e9is de topologia visual deste dashboard ainda usam o plugin `agenty-flowcharting-panel` (Angular), que Grafana 11+ n\u00e3o carrega. Os pain\u00e9is nativos abaixo (gr\u00e1ficos, s\u00e9ries temporais, tabelas) funcionam normalmente. Migra\u00e7\u00e3o planejada \u2014 ver [`docs/superpowers/specs/2026-04-26-grafana-12-modernization-design.md`](.)."
+      },
+      "datasource": null
+    },
+    {
       "datasource": "$data_source",
       "description": "![Cisco UCS Architecture](/public/img/utm/ucs_architecture.png)\nUTM collector - v$utm_collector_ver  \nUTM GUI - v0.52  \nby Paresh Gupta",
       "fieldConfig": {
@@ -32,7 +48,7 @@
         "h": 3,
         "w": 24,
         "x": 0,
-        "y": 0
+        "y": 3
       },
       "id": 486,
       "options": {
@@ -117,7 +133,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 3
+        "y": 6
       },
       "id": 708,
       "newFlag": false,
@@ -535,7 +551,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 8
       },
       "id": 598,
       "options": {
@@ -592,7 +608,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 7
+        "y": 10
       },
       "id": 121,
       "panels": [],
@@ -616,7 +632,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 11
       },
       "hiddenSeries": false,
       "id": 117,
@@ -749,7 +765,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 11
       },
       "hiddenSeries": false,
       "id": 171,
@@ -882,7 +898,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 19
       },
       "hiddenSeries": false,
       "id": 170,
@@ -1015,7 +1031,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 19
       },
       "hiddenSeries": false,
       "id": 169,
@@ -1138,7 +1154,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 27
       },
       "id": 157,
       "panels": [
@@ -1695,7 +1711,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 25
+        "y": 28
       },
       "id": 161,
       "panels": [
@@ -2344,7 +2360,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 29
       },
       "id": 175,
       "panels": [

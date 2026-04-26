@@ -22,6 +22,22 @@
   "links": [],
   "panels": [
     {
+      "id": 999,
+      "type": "text",
+      "title": "Migration notice",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "> \u26a0\ufe0f **Migration in progress.** Os pain\u00e9is de topologia visual deste dashboard ainda usam o plugin `agenty-flowcharting-panel` (Angular), que Grafana 11+ n\u00e3o carrega. Os pain\u00e9is nativos abaixo (gr\u00e1ficos, s\u00e9ries temporais, tabelas) funcionam normalmente. Migra\u00e7\u00e3o planejada \u2014 ver [`docs/superpowers/specs/2026-04-26-grafana-12-modernization-design.md`](.)."
+      },
+      "datasource": null
+    },
+    {
       "datasource": "$data_source",
       "description": "![Cisco UCS Architecture](/public/img/utm/ucs_architecture.png)\nUTM collector - v$utm_collector_ver  \nUTM GUI - v0.52  \nby Paresh Gupta",
       "fieldConfig": {
@@ -32,7 +48,7 @@
         "h": 3,
         "w": 24,
         "x": 0,
-        "y": 0
+        "y": 3
       },
       "id": 360,
       "options": {
@@ -117,7 +133,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 3
+        "y": 6
       },
       "id": 376,
       "newFlag": false,
@@ -536,7 +552,7 @@
         "h": 2,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 8
       },
       "id": 362,
       "options": {
@@ -593,7 +609,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 7
+        "y": 10
       },
       "id": 189,
       "panels": [],
@@ -617,7 +633,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 11
       },
       "hiddenSeries": false,
       "id": 110,
@@ -837,7 +853,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 11
       },
       "hiddenSeries": false,
       "id": 111,
@@ -1124,7 +1140,7 @@
         "h": 13,
         "w": 6,
         "x": 0,
-        "y": 16
+        "y": 19
       },
       "id": 310,
       "interval": "[[polling_interval]]s",
@@ -1334,7 +1350,7 @@
         "h": 13,
         "w": 6,
         "x": 6,
-        "y": 16
+        "y": 19
       },
       "id": 464,
       "interval": "[[polling_interval]]s",
@@ -1544,7 +1560,7 @@
         "h": 13,
         "w": 6,
         "x": 12,
-        "y": 16
+        "y": 19
       },
       "id": 465,
       "interval": "[[polling_interval]]s",
@@ -1754,7 +1770,7 @@
         "h": 13,
         "w": 6,
         "x": 18,
-        "y": 16
+        "y": 19
       },
       "id": 466,
       "interval": "[[polling_interval]]s",
@@ -1951,7 +1967,7 @@
         "h": 13,
         "w": 6,
         "x": 0,
-        "y": 29
+        "y": 32
       },
       "id": 481,
       "interval": "[[polling_interval]]s",
@@ -2153,7 +2169,7 @@
         "h": 13,
         "w": 6,
         "x": 6,
-        "y": 29
+        "y": 32
       },
       "id": 483,
       "interval": "[[polling_interval]]s",
@@ -2355,7 +2371,7 @@
         "h": 13,
         "w": 6,
         "x": 12,
-        "y": 29
+        "y": 32
       },
       "id": 485,
       "interval": "[[polling_interval]]s",
@@ -2557,7 +2573,7 @@
         "h": 13,
         "w": 6,
         "x": 18,
-        "y": 29
+        "y": 32
       },
       "id": 487,
       "interval": "[[polling_interval]]s",
@@ -2695,7 +2711,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 45
       },
       "id": 124,
       "panels": [
@@ -3728,7 +3744,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 46
       },
       "id": 67,
       "panels": [
@@ -4769,7 +4785,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 44
+        "y": 47
       },
       "id": 252,
       "panels": [
@@ -6470,7 +6486,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 48
       },
       "id": 236,
       "panels": [
@@ -8171,7 +8187,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 46
+        "y": 49
       },
       "id": 304,
       "panels": [
@@ -8762,7 +8778,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 50
       },
       "id": 392,
       "panels": [
@@ -10421,7 +10437,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 48
+        "y": 51
       },
       "id": 22,
       "panels": [
@@ -12090,7 +12106,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 49
+        "y": 52
       },
       "id": 306,
       "panels": [
@@ -12399,7 +12415,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 53
       },
       "id": 196,
       "panels": [
@@ -14058,7 +14074,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 54
       },
       "id": 187,
       "panels": [
@@ -14601,7 +14617,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 55
       },
       "id": 121,
       "panels": [
@@ -15148,7 +15164,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 56
       },
       "id": 227,
       "panels": [
@@ -16735,7 +16751,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 57
       },
       "id": 178,
       "panels": [
@@ -18322,7 +18338,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 55
+        "y": 58
       },
       "id": 70,
       "panels": [
