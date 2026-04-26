@@ -8,3 +8,7 @@ __pycache__/
 # Stray runtime artifacts (logs, pickle caches) from local invocation
 *.log
 *.pickle
+
+# test-env runtime secrets/state
+test-env/.env
+test-env/creds.env
