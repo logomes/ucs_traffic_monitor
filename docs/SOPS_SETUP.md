@@ -14,14 +14,25 @@ explicitly excluded from backups.
 
 ## Bootstrap (one-time per environment)
 
-### 1. Install SOPS and age
+### 1. Install SOPS, age, and PyYAML
+
+The decrypt helper (`bin/utm-decrypt-creds.sh`) shells out to `sops` and
+parses the decrypted YAML with PyYAML at boot. PyYAML is not part of the
+Python stdlib — it must be installed system-wide so the systemd unit can
+import it.
 
 ```sh
 # Arch / CachyOS
-sudo pacman -S sops age
+sudo pacman -S sops age python-yaml
 
 # Debian / Ubuntu (>=22.04)
-sudo apt install sops age
+sudo apt install sops age python3-yaml
+```
+
+Verify the import works as `root` (the user that runs the oneshot):
+
+```sh
+sudo python3 -c "import yaml; print(yaml.__version__)"
 ```
 
 ### 2. Generate the age key on the VM
