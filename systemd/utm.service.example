@@ -1,0 +1,36 @@
+# UCS Traffic Monitor — example systemd unit
+# Copy to /etc/systemd/system/utm.service and adjust paths.
+#
+# This unit assumes:
+#  - The script lives at /opt/utm/ucs_traffic_monitor.py
+#  - Credentials are in /etc/utm/creds.env (chmod 600, owner telegraf)
+#  - Output goes to telegraf via stdout (configure telegraf exec accordingly)
+#
+# For the SOPS-based fork deployment, use:
+#  - EnvironmentFile=/run/utm/creds.env  (tmpfs, regenerated each boot)
+#  - After=utm-creds.service
+#  - Requires=utm-creds.service
+
+[Unit]
+Description=UCS Traffic Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telegraf
+Group=telegraf
+EnvironmentFile=/etc/utm/creds.env
+ExecStart=/usr/bin/python3 /opt/utm/ucs_traffic_monitor.py influxdb-lp --instance-name utm
+Restart=on-failure
+RestartSec=30s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/telegraf
+
+[Install]
+WantedBy=multi-user.target
