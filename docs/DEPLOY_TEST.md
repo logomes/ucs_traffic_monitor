@@ -246,13 +246,93 @@ docker compose up -d --build     # ressuscita do zero
 
 ---
 
+## 🚀 Deploy completo na VM de produção (RECOMENDADO — substitui o tarball antigo)
+
+**Este é o tarball atual, com TUDO consolidado** (credentials refactor + dashboards Grafana 12 + operator scripts + auto-rollback).
+
+**Tarball:** `~/utm-prod-deploy-952017c.tar.gz` (132 KB)
+
+### 1. Copiar pra VM
+
+```fish
+scp ~/utm-prod-deploy-952017c.tar.gz seu-usuario@ip-da-vm:/tmp/
+```
+
+### 2. Na VM — dry-run primeiro (ver o que SERIA feito)
+
+```sh
+cd /tmp
+mkdir -p utm-deploy && tar xzf utm-prod-deploy-952017c.tar.gz -C utm-deploy
+cd utm-deploy
+sudo ./install.sh --dry-run 2>&1 | less
+```
+
+Inspecione a saída — confirma os paths (`UTM_DIR`, `TELEGRAF_CONF_PATH`) e plano de execução.
+
+### 3. Na VM — execução real
+
+```sh
+sudo ./install.sh
+```
+
+- Aprox. 3 min total
+- Vai pedir confirmação após o backup automático
+- Vai pedir credencial admin do Grafana pra snapshot dos dashboards atuais (use `SKIP_GRAFANA_BACKUP=1` se quiser pular)
+- **Auto-rollback** se qualquer phase falhar — VM volta ao estado anterior automaticamente
+- 11 phases: preflight → backup → stop telegraf → deploy scripts → migrate creds → update telegraf.conf → systemd drop-in → provisioning → restart → validate → summary
+
+### 4. Validação visual
+
+```sh
+sudo journalctl -u telegraf -f   # acompanhar por uns 10 min, esperar ver "Added.*to domain dict"
+```
+
+Browser: `http://<vm-ip>:3000` → folder UTM → abrir os 9 dashboards e confirmar:
+- Welcome: header com counts ($num_domain etc)
+- Locations / Domain Overview / Chassis PAUSE: navbar funciona, painéis com dados reais
+- Outros dashboards: gráficos nativos com dados, navbar links funcionando
+
+### 5. Após 24-48h estáveis — apagar credenciais antigas
+
+```sh
+for f in /usr/local/telegraf/ucs_domains_group_*.txt; do
+    sudo shred -u "$f"
+done
+```
+
+### Rollback (se descobrir problema depois do deploy)
+
+```sh
+sudo bash /root/utm-pre-upgrade-<DATE>/rollback.sh
+```
+
+O install.sh gerou esse script automaticamente durante o backup. Restaura tudo (script python, telegraf.conf, ucs_domains_group_*.txt, remove drop-in/provisioning) e reinicia serviços.
+
+### Variáveis de override (caso seu setup tenha paths customizados)
+
+```sh
+sudo UTM_DIR=/opt/utm \
+     TELEGRAF_CONF_PATH=/etc/telegraf/telegraf.conf \
+     CREDS_DIR=/etc/utm \
+     INSTANCE_NAME=utm \
+     ./install.sh
+```
+
+---
+
 ## Arquivos importantes
 
 - Este doc: `~/Downloads/ucs_traffic_monitor/docs/DEPLOY_TEST.md`
-- Tarball (deploy direto na VM): `~/utm-changes.tar.gz`
-- Repo local: `~/Downloads/ucs_traffic_monitor/` (branch `feat/credentials-env-vars`)
-- Stack Docker: `~/Downloads/ucs_traffic_monitor/test-env/`
+- **🟢 Tarball atual (use este):** `~/utm-prod-deploy-952017c.tar.gz` (deploy completo idempotente)
+- ⚪ Tarball antigo (não precisa mais): `~/utm-changes.tar.gz` (só credentials, parcial)
+- Repo local: `~/Downloads/ucs_traffic_monitor/`
+- Branches:
+  - `feat/credentials-env-vars` — credentials refactor + bash hygiene + test-env Docker
+  - `feat/grafana-12-modernization` — branch acima + 9 dashboards migrados
+  - `feat/prod-rollout-grafana-12` — branch acima + deploy/install.sh (TARBALL gera deste branch)
+- Stack Docker (test local): `~/Downloads/ucs_traffic_monitor/test-env/`
 - Specs/designs: `~/Downloads/ucs_traffic_monitor/docs/superpowers/specs/`
 - Planos: `~/Downloads/ucs_traffic_monitor/docs/superpowers/plans/`
 - Doc SOPS (Phase 5, futuro): `~/Downloads/ucs_traffic_monitor/docs/SOPS_SETUP.md`
 - README do test-env: `~/Downloads/ucs_traffic_monitor/test-env/README.md`
+- README do tarball de prod: `~/Downloads/ucs_traffic_monitor/deploy/README.md`
