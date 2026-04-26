@@ -17,6 +17,7 @@ from collections import Counter
 import concurrent.futures
 from ucsmsdk.ucshandle import UcsHandle
 from netmiko import ConnectHandler
+import credentials
 
 HOURS_IN_DAY = 24
 MINUTES_IN_HOUR = 60
@@ -218,72 +219,51 @@ def setup_logging():
 
 def get_ucs_domains():
     """
-    Parse the --input-file argument to get UCS domain(s)
+    Load UCS domain credentials from environment variables and initialize
+    the global state structures (domain_dict, stats_dict, conn_dict,
+    response_time_dict).
 
-    The format of the file is expected to carry a list as:
-    <IP Address 1>,username 1,password 1
-    <IP Address 2>,username 2,password 2
-    Only one entry is expected per line. Line with prefix # is ignored
-    Location is specified between []
-    Initialize stats_dict for valid UCS domain
+    Credentials are read by the credentials module from env vars:
+    UTM_DOMAINS=dom1,dom2,...
+    UTM_<id>_HOST, UTM_<id>_USER, UTM_<id>_PASS, UTM_<id>_GROUP (optional)
+
+    Exits with code 2 (via SystemExit raised by credentials module) if
+    required env vars are missing.
 
     Parameters:
     None
 
     Returns:
     None
-
     """
-
     global domain_dict
-    location = ''
-    input_file = user_args['input_file']
-    with open(input_file, 'r') as f:
-        for line in f:
-            if not line.startswith('#'):
-                line = line.strip()
-                if line.startswith('['):
-                    if not line.endswith(']'):
-                        logger.error('Input file {} format error. Line starts' \
-                        ' with [ but does not end with ]: {}\nExiting...' \
-                        .format(input_file, line))
-                        sys.exit()
-                    line = line.replace('[', '')
-                    line = line.replace(']', '')
-                    line = line.strip()
-                    location = line
-                    continue
 
-                domain = line.split(',')
-                if len(domain) < 3:
-                    logger.warning('Line not in correct input format:'
-                                    'IP_Address,username,password')
-                    continue
-                domain_dict[domain[0]] = [domain[1], domain[2]]
-                logger.info('Added {} to domain dict'.format(domain[0]))
-                stats_dict[domain[0]] = {}
-                stats_dict[domain[0]]['location'] = location
-                stats_dict[domain[0]]['A'] = {}
-                stats_dict[domain[0]]['A']['fi_ports'] = {}
-                stats_dict[domain[0]]['B'] = {}
-                stats_dict[domain[0]]['B']['fi_ports'] = {}
-                stats_dict[domain[0]]['chassis'] = {}
-                stats_dict[domain[0]]['ru'] = {}
-                stats_dict[domain[0]]['fex'] = {}
+    domains = credentials.load_domains_from_env()
 
-                conn_dict[domain[0]] = {}
+    for domain in domains:
+        ip = domain.host
+        domain_dict[ip] = [domain.user, domain.password]
+        logger.info('Added {} to domain dict'.format(ip))
 
-                response_time_dict[domain[0]] = {}
-                response_time_dict[domain[0]]['cli_start'] = 0
-                response_time_dict[domain[0]]['cli_login'] = 0
-                response_time_dict[domain[0]]['cli_end'] = 0
-                response_time_dict[domain[0]]['sdk_start'] = 0
-                response_time_dict[domain[0]]['sdk_login'] = 0
-                response_time_dict[domain[0]]['sdk_end'] = 0
+        stats_dict[ip] = {}
+        stats_dict[ip]['location'] = domain.group
+        stats_dict[ip]['A'] = {}
+        stats_dict[ip]['A']['fi_ports'] = {}
+        stats_dict[ip]['B'] = {}
+        stats_dict[ip]['B']['fi_ports'] = {}
+        stats_dict[ip]['chassis'] = {}
+        stats_dict[ip]['ru'] = {}
+        stats_dict[ip]['fex'] = {}
 
-    if not domain_dict:
-        logger.warning('No UCS domains to monitor. Check input file. Exiting.')
-        sys.exit()
+        conn_dict[ip] = {}
+
+        response_time_dict[ip] = {}
+        response_time_dict[ip]['cli_start'] = 0
+        response_time_dict[ip]['cli_login'] = 0
+        response_time_dict[ip]['cli_end'] = 0
+        response_time_dict[ip]['sdk_start'] = 0
+        response_time_dict[ip]['sdk_login'] = 0
+        response_time_dict[ip]['sdk_end'] = 0
 
 def unpickle_connections():
     """
