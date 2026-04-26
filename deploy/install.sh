@@ -22,8 +22,10 @@ set -euo pipefail
 
 # ---------- Constants ----------
 
+# shellcheck disable=SC2155
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly FILES_DIR="${SCRIPT_DIR}/files"
+# shellcheck disable=SC2155
 readonly DATE_TAG="$(date +%Y-%m-%d_%H%M%S)"
 
 # Configurable via env
@@ -292,7 +294,149 @@ if [[ -n "$ROLLBACK_DIR" ]]; then
     fi
 fi
 
+stop_telegraf() {
+    log_step "Phase 3/11 — Stop telegraf"
+    run systemctl stop telegraf
+    # Wait up to 30s for it to actually stop
+    for _ in $(seq 1 30); do
+        if ! systemctl is-active --quiet telegraf; then
+            log_info "telegraf stopped"
+            return 0
+        fi
+        sleep 1
+    done
+    log_error "telegraf did not stop within 30s"
+    return 1
+}
+
+deploy_scripts() {
+    log_step "Phase 4/11 — Deploy script files"
+
+    run install -m 644 "${FILES_DIR}/credentials.py" "${UTM_DIR}/credentials.py"
+    log_info "Installed credentials.py"
+
+    run install -m 755 "${FILES_DIR}/ucs_traffic_monitor.py" "${UTM_DIR}/ucs_traffic_monitor.py"
+    log_info "Installed ucs_traffic_monitor.py"
+
+    run install -d -m 755 "${UTM_DIR}/lib"
+    run install -m 644 "${FILES_DIR}/lib/utm-common.sh" "${UTM_DIR}/lib/utm-common.sh"
+    log_info "Installed lib/utm-common.sh"
+
+    run install -d -m 755 "${UTM_DIR}/scripts"
+    run install -m 755 "${FILES_DIR}/scripts/migrate_credentials.py" "${UTM_DIR}/scripts/migrate_credentials.py"
+    log_info "Installed scripts/migrate_credentials.py"
+
+    run install -m 755 "${FILES_DIR}/upgrade_utm.sh" "${UTM_DIR}/upgrade_utm.sh"
+    run install -m 755 "${FILES_DIR}/backup_utm_dashboards.sh" "${UTM_DIR}/backup_utm_dashboards.sh"
+    log_info "Installed operator scripts"
+
+    # Compat symlink
+    if [[ "$DRY_RUN" != "1" ]]; then
+        ln -sfn backup_utm_dashboards.sh "${UTM_DIR}/backup_utm_bashboards.sh"
+    fi
+    log_info "Created compat symlink backup_utm_bashboards.sh"
+}
+
+migrate_credentials() {
+    log_step "Phase 5/11 — Migrate credentials"
+
+    run install -d -m 0700 -o telegraf -g telegraf "$CREDS_DIR"
+
+    if [[ -f "${CREDS_DIR}/creds.env" ]]; then
+        log_warn "${CREDS_DIR}/creds.env already exists — skipping migration (idempotent)"
+        return 0
+    fi
+
+    local found=0
+    local first_target="${CREDS_DIR}/creds.env"
+    local n=0
+    for f in "${UTM_DIR}"/ucs_domains_group_*.txt; do
+        [[ ! -f "$f" ]] && continue
+        n=$((n + 1))
+        local target
+        if [[ "$n" -eq 1 ]]; then
+            target="$first_target"
+        else
+            target="${CREDS_DIR}/creds_${n}.env"
+        fi
+
+        if [[ "$DRY_RUN" == "1" ]]; then
+            log_info "DRY-RUN: would migrate $f → $target"
+            continue
+        fi
+
+        python3 "${UTM_DIR}/scripts/migrate_credentials.py" \
+            --input "$f" --output "$target"
+        chown telegraf:telegraf "$target"
+        chmod 600 "$target"
+        log_info "Migrated $(basename "$f") → $target"
+        found=$((found + 1))
+    done
+
+    if [[ "$found" -eq 0 && "$DRY_RUN" != "1" ]]; then
+        log_warn "No legacy ucs_domains_group_*.txt files found"
+        log_warn "Create ${CREDS_DIR}/creds.env manually before starting telegraf, e.g.:"
+        log_warn "  echo 'UTM_DOMAINS=dom1' > ${CREDS_DIR}/creds.env"
+        log_warn "  echo 'UTM_dom1_HOST=10.0.0.X' >> ${CREDS_DIR}/creds.env"
+        log_warn "  echo 'UTM_dom1_USER=monitoring' >> ${CREDS_DIR}/creds.env"
+        log_warn "  echo 'UTM_dom1_PASS=...' >> ${CREDS_DIR}/creds.env"
+        log_warn "  chmod 600 ${CREDS_DIR}/creds.env"
+        log_warn "  chown telegraf:telegraf ${CREDS_DIR}/creds.env"
+    fi
+
+    if [[ "$n" -gt 1 ]]; then
+        log_warn "$n legacy files found; only first one ($first_target) is wired into the systemd drop-in."
+        log_warn "For multi-instance, edit /etc/systemd/system/telegraf.service.d/utm-creds.conf"
+        log_warn "or create separate telegraf instances. See README for details."
+    fi
+}
+
+update_telegraf_conf() {
+    log_step "Phase 6/11 — Update telegraf.conf"
+
+    if grep -q -- "--instance-name" "$TELEGRAF_CONF_PATH"; then
+        log_warn "telegraf.conf already contains --instance-name — skipping (idempotent)"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log_info "DRY-RUN: would edit $TELEGRAF_CONF_PATH to use --instance-name $INSTANCE_NAME"
+        return 0
+    fi
+
+    cp -p "$TELEGRAF_CONF_PATH" "${TELEGRAF_CONF_PATH}.bak.${DATE_TAG}"
+    log_info "Saved backup at ${TELEGRAF_CONF_PATH}.bak.${DATE_TAG}"
+
+    # Match: python3 .../ucs_traffic_monitor.py .../ucs_domains_group_N.txt influxdb-lp -vv
+    # Replace with: python3 .../ucs_traffic_monitor.py influxdb-lp --instance-name <name> -vv
+    # We use sed with extended regex.
+    sed -i -E "s|(python3[[:space:]]+[^[:space:]]*ucs_traffic_monitor\\.py)[[:space:]]+[^[:space:]]+\\.txt[[:space:]]+(influxdb-lp)|\\1 \\2 --instance-name ${INSTANCE_NAME}|g" \
+        "$TELEGRAF_CONF_PATH"
+
+    if grep -q -- "--instance-name" "$TELEGRAF_CONF_PATH"; then
+        log_info "telegraf.conf updated to invoke ucs_traffic_monitor.py with --instance-name ${INSTANCE_NAME}"
+    else
+        log_error "Failed to update telegraf.conf — invocation pattern not matched."
+        log_error "Inspect manually: grep ucs_traffic_monitor $TELEGRAF_CONF_PATH"
+        return 1
+    fi
+}
+
+# ---------- (final phases in next task) ----------
+
+if [[ -n "$ROLLBACK_DIR" ]]; then
+    if [[ ! -d "$ROLLBACK_DIR" ]]; then
+        log_error "Rollback dir not found: $ROLLBACK_DIR"
+        exit 1
+    fi
+    exec bash "${ROLLBACK_DIR}/rollback.sh"
+fi
+
 preflight
 backup
-log_info "Phases 1-2 complete. (More phases coming in next task — install will fail here.)"
+stop_telegraf
+deploy_scripts
+migrate_credentials
+update_telegraf_conf
+log_info "Phases 1-6 complete. (More phases coming in next task — install will incomplete here.)"
 exit 0
