@@ -1,0 +1,31 @@
+[project]
+name = "ucs-traffic-monitor"
+version = "0.53.0"
+description = "Cisco UCS metrics collector for Telegraf/InfluxDB/Grafana"
+requires-python = ">=3.10"
+dependencies = [
+    "ucsmsdk",
+    "netmiko>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"telegraf/ucs_traffic_monitor.py" = ["E", "F", "W", "B", "UP"]
