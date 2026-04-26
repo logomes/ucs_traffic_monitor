@@ -96,3 +96,63 @@ utm::download_with_checksum() {
     utm::log info "Verified ${output} (sha256 ok)"
     return 0
 }
+
+# utm::grafana_curl <method> <path> [<extra-curl-args>...]
+# Wraps curl with --user (no creds in URL), JSON headers, fail-on-HTTP-error.
+# Requires GRAFANA_USER and GRAFANA_PASSWORD to be set.
+utm::grafana_curl() {
+    local method="${1:?method required}"
+    local path="${2:?path required}"
+    shift 2
+    curl -fsS \
+        --user "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
+        -H 'Accept: application/json' \
+        -H 'Content-Type: application/json' \
+        -X "$method" \
+        "$@" \
+        "http://${UTM_GRAFANA_HOST}${path}"
+}
+
+# utm::grafana_login_loop
+# Prompts user/password until /api/org succeeds. Sets globals
+# GRAFANA_USER and GRAFANA_PASSWORD.
+utm::grafana_login_loop() {
+    while true; do
+        unset GRAFANA_USER GRAFANA_PASSWORD
+        while [[ -z "${GRAFANA_USER:-}" ]]; do
+            read -r -p "Grafana User: " GRAFANA_USER
+        done
+        while [[ -z "${GRAFANA_PASSWORD:-}" ]]; do
+            read -r -s -p "Password: " GRAFANA_PASSWORD
+            printf '\n'
+        done
+
+        local resp
+        if resp="$(utm::grafana_curl GET /api/org 2>&1)"; then
+            utm::log info "Authenticated to Grafana as ${GRAFANA_USER}"
+            return 0
+        fi
+        utm::log warning "Authentication failed: ${resp}"
+        utm::log warning "Please try again."
+    done
+}
+
+# utm::backup_dashboard <uid> <output-file>
+# Saves the full dashboard JSON returned by /api/dashboards/uid/<uid>.
+utm::backup_dashboard() {
+    local uid="${1:?uid required}"
+    local out="${2:?output file required}"
+    utm::grafana_curl GET "/api/dashboards/uid/${uid}" > "$out"
+}
+
+# utm::backup_all_dashboards <dest-dir>
+# Backs up every dashboard in UTM_DASHBOARDS to <dest-dir>/<name>.json.
+utm::backup_all_dashboards() {
+    local dest="${1:?destination directory required}"
+    local name uid
+    for name in "${!UTM_DASHBOARDS[@]}"; do
+        uid="${UTM_DASHBOARDS[$name]}"
+        utm::backup_dashboard "$uid" "${dest}/${name}.json"
+        utm::log info "Backed up ${name} (uid=${uid})"
+    done
+}
