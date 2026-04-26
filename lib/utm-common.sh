@@ -45,6 +45,7 @@ utm::confirm() {
 # Canonical dashboard UID list. Single source of truth — both the upgrade
 # script and the backup script consume this. Adding a new dashboard means
 # editing one line here.
+# shellcheck disable=SC2034
 declare -gA UTM_DASHBOARDS=(
     ["locations"]="ri2OFp4Wz"
     ["domain_overview"]="Inte2EIWk"
@@ -63,4 +64,35 @@ utm::require_jq() {
         utm::log error "jq is required but not installed. Install via your package manager (e.g., 'sudo pacman -S jq' or 'sudo yum install jq')."
         exit 1
     fi
+}
+
+# utm::download_with_checksum <url> <expected-sha256> <output-path>
+# Downloads url to output-path, verifies SHA256 matches expected.
+# On mismatch: deletes output, exits 1 with diagnostic.
+# Implementation uses curl (-fL: fail on HTTP error, follow redirects).
+utm::download_with_checksum() {
+    local url="${1:?url required}"
+    local expected="${2:?expected sha256 required}"
+    local output="${3:?output path required}"
+
+    utm::log info "Downloading ${url}"
+    if ! curl -fLs --output "$output" "$url"; then
+        utm::log error "Download failed: ${url}"
+        return 1
+    fi
+
+    local actual
+    actual="$(sha256sum "$output" | awk '{print $1}')"
+
+    # Case-insensitive comparison.
+    if [[ "${actual,,}" != "${expected,,}" ]]; then
+        utm::log error "SHA256 mismatch for ${output}"
+        utm::log error "  expected: ${expected}"
+        utm::log error "  actual:   ${actual}"
+        rm -f "$output"
+        return 1
+    fi
+
+    utm::log info "Verified ${output} (sha256 ok)"
+    return 0
 }
