@@ -1062,8 +1062,8 @@
   "schemaVersion": 22,
   "style": "dark",
   "tags": [
-    "Cisco",
-    "UTM"
+    "cisco",
+    "UCS"
   ],
   "templating": {
     "list": [
@@ -1218,6 +1218,5 @@
   "timezone": "browser",
   "title": "Welcome",
   "uid": "8dhtjXDZk",
-  "tags": ["cisco","UCS"],
   "version": 3
 }
