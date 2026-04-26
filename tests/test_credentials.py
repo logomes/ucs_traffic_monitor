@@ -75,3 +75,15 @@ def test_error_message_does_not_leak_existing_values(monkeypatch, capsys):
     assert secret_value not in err
     assert "10.0.0.10" not in err
     assert "monitoring" not in err
+
+
+def test_whitespace_in_utm_domains_is_tolerated(monkeypatch):
+    monkeypatch.setenv("UTM_DOMAINS", "  dom1 , dom2,  dom3  ")
+    for domain_id in ("dom1", "dom2", "dom3"):
+        monkeypatch.setenv(f"UTM_{domain_id}_HOST", f"10.0.0.{domain_id[-1]}")
+        monkeypatch.setenv(f"UTM_{domain_id}_USER", "u")
+        monkeypatch.setenv(f"UTM_{domain_id}_PASS", "p")
+
+    domains = load_domains_from_env()
+
+    assert [d.id for d in domains] == ["dom1", "dom2", "dom3"]
