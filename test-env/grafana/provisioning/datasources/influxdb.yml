@@ -1,0 +1,12 @@
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB-UTM
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    database: utm
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMode: GET
