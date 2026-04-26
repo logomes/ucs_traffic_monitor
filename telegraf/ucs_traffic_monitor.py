@@ -29,7 +29,7 @@ MASTER_TIMEOUT = 48
 
 user_args = {}
 FILENAME_PREFIX = __file__.replace('.py', '')
-INPUT_FILE_PREFIX = ''
+INSTANCE_NAME = 'utm'
 
 LOGFILE_LOCATION = '/var/log/telegraf/'
 LOGFILE_SIZE = 20000000
@@ -141,8 +141,6 @@ def parse_cmdline_arguments():
 
     parser = argparse.ArgumentParser(description=desc_str, epilog=epilog_str,
                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('input_file', action='store', help='file containing \
-                    the UCS domain information in the format: IP,user,password')
     parser.add_argument('output_format', action='store', help='specify the \
                     output format', choices=['dict', 'influxdb-lp'])
     parser.add_argument('-V', '--verify-only', dest='verify_only', \
@@ -167,8 +165,10 @@ def parse_cmdline_arguments():
                     action='store_true', default=False, help='debug and above')
     parser.add_argument('-vvvv', '--raw_dump', dest='raw_dump', \
                     action='store_true', default=False, help='Dump raw data')
+    parser.add_argument('--instance-name', dest='instance_name', default='utm',
+                    help='Logical name for this instance, used as suffix for log '
+                         'files and pickle files (default: utm)')
     args = parser.parse_args()
-    user_args['input_file'] = args.input_file
     user_args['verify_only'] = args.verify_only
     user_args['conn_timeout'] = args.conn_timeout
     user_args['no_ssh'] = args.no_ssh
@@ -179,8 +179,9 @@ def parse_cmdline_arguments():
     user_args['most_verbose'] = args.most_verbose
     user_args['raw_dump'] = args.raw_dump
 
-    global INPUT_FILE_PREFIX
-    INPUT_FILE_PREFIX = ((((user_args['input_file']).split('/'))[-1]).split('.'))[0]
+    user_args['instance_name'] = args.instance_name
+    global INSTANCE_NAME
+    INSTANCE_NAME = args.instance_name
 
 def setup_logging():
     this_filename = (FILENAME_PREFIX.split('/'))[-1]
@@ -194,7 +195,7 @@ def setup_logging():
         # Log in local directory if can't be created in LOGFILE_LOCATION
         logfile_prefix = FILENAME_PREFIX
     finally:
-        logfile_name = logfile_prefix + '_' + INPUT_FILE_PREFIX + '.log'
+        logfile_name = logfile_prefix + '_' + INSTANCE_NAME + '.log'
         rotator = RotatingFileHandler(logfile_name, maxBytes=LOGFILE_SIZE,
                                       backupCount=LOGFILE_NUMBER)
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -316,7 +317,7 @@ def unpickle_connections():
     global domain_dict
     global pickled_connections
     existing_pickled_sessions = {}
-    pickle_file_name = FILENAME_PREFIX + '_' + INPUT_FILE_PREFIX + '.pickle'
+    pickle_file_name = FILENAME_PREFIX + '_' + INSTANCE_NAME + '.pickle'
     sdk_time = 0
 
     try:
@@ -614,7 +615,7 @@ def cleanup_ucs_connections():
         sdk_handle.logout()
 
     # Write an empty dictionary in pickle_file for next time
-    pickle_file_name = FILENAME_PREFIX + '_' + INPUT_FILE_PREFIX + '.pickle'
+    pickle_file_name = FILENAME_PREFIX + '_' + INSTANCE_NAME + '.pickle'
     empty_dict = {}
 
     try:
@@ -649,7 +650,7 @@ def pickle_connections():
         return
 
     global conn_dict
-    pickle_file_name = FILENAME_PREFIX + '_' + INPUT_FILE_PREFIX + '.pickle'
+    pickle_file_name = FILENAME_PREFIX + '_' + INSTANCE_NAME + '.pickle'
 
     '''
     Following block of code sets all the cli_handle to None because they
