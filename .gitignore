@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+
+# Stray runtime artifacts (logs, pickle caches) from local invocation
+*.log
+*.pickle
