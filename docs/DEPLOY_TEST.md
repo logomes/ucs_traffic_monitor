@@ -184,11 +184,75 @@ sudo shred -u /root/ucs_domains_group_*.txt
 
 ---
 
+## 🐳 Ambiente de teste local com Docker (após reboot)
+
+Os arquivos da stack Docker estão prontos em `test-env/` (commits `2f9fb5d..aeafc92` no branch `feat/credentials-env-vars`). Após o reboot:
+
+### 1. Instalar Docker
+
+```fish
+sudo pacman -S docker docker-compose
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker          # ou abrir novo terminal
+docker run --rm hello-world
+```
+
+Espera o `hello-world` imprimir "Hello from Docker!". Se não, investigue antes de seguir.
+
+### 2. Subir a stack
+
+```fish
+cd ~/Downloads/ucs_traffic_monitor/test-env
+cp .env.example .env
+cp creds.env.example creds.env
+chmod 600 creds.env
+docker compose up -d --build
+docker compose logs -f       # ctrl+c quando ver "tick N: wrote X lines"
+```
+
+Primeiro build leva ~3-5min (puxa imagens, builda telegraf custom com Python+ucsmsdk+netmiko).
+
+### 3. Validar (após ~90s do `up`)
+
+```fish
+docker compose ps                                                                    # 4 services running
+
+curl -s http://localhost:8086/ping -o /dev/null -w '%{http_code}\n'                  # 204
+curl -s -G http://localhost:8086/query --data-urlencode 'q=SHOW MEASUREMENTS ON utm' | python3 -m json.tool
+
+curl -sf http://localhost:3000/api/health | python3 -m json.tool                     # status ok
+
+docker compose exec telegraf cat /var/log/telegraf/ucs_traffic_monitor/ucs_traffic_monitor_utm.log | grep "Added"
+```
+
+Browser: http://localhost:3000 → admin/admin → folder **UTM** → abre `domain_overview` → painéis devem mostrar dados sintéticos.
+
+### 4. Apontar pra UCS real (quando tiver acesso)
+
+```fish
+$EDITOR test-env/creds.env       # troca host/user/pass por reais
+docker compose stop syn-data     # desliga gerador sintético
+docker compose restart telegraf  # recarrega env vars
+docker compose logs -f telegraf  # acompanha coleta
+```
+
+### 5. Reset / cleanup
+
+```fish
+docker compose down -v           # apaga volumes (dados Influx + state Grafana)
+docker compose up -d --build     # ressuscita do zero
+```
+
+---
+
 ## Arquivos importantes
 
 - Este doc: `~/Downloads/ucs_traffic_monitor/docs/DEPLOY_TEST.md`
-- Tarball: `~/utm-changes.tar.gz`
+- Tarball (deploy direto na VM): `~/utm-changes.tar.gz`
 - Repo local: `~/Downloads/ucs_traffic_monitor/` (branch `feat/credentials-env-vars`)
-- Spec/design: `~/Downloads/ucs_traffic_monitor/docs/superpowers/specs/2026-04-25-utm-credentials-design.md`
-- Plano: `~/Downloads/ucs_traffic_monitor/docs/superpowers/plans/2026-04-25-utm-credentials.md`
+- Stack Docker: `~/Downloads/ucs_traffic_monitor/test-env/`
+- Specs/designs: `~/Downloads/ucs_traffic_monitor/docs/superpowers/specs/`
+- Planos: `~/Downloads/ucs_traffic_monitor/docs/superpowers/plans/`
 - Doc SOPS (Phase 5, futuro): `~/Downloads/ucs_traffic_monitor/docs/SOPS_SETUP.md`
+- README do test-env: `~/Downloads/ucs_traffic_monitor/test-env/README.md`
