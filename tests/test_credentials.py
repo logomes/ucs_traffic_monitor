@@ -32,3 +32,13 @@ def test_exits_when_utm_domains_unset(monkeypatch, capsys):
     assert exc_info.value.code == 2
     captured = capsys.readouterr()
     assert "UTM_DOMAINS" in captured.err
+
+
+def test_exits_when_utm_domains_empty_string(monkeypatch, capsys):
+    monkeypatch.setenv("UTM_DOMAINS", "")
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_domains_from_env()
+
+    assert exc_info.value.code == 2
+    assert "UTM_DOMAINS" in capsys.readouterr().err
