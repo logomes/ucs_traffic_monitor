@@ -179,7 +179,6 @@ def parse_cmdline_arguments():
     user_args['most_verbose'] = args.most_verbose
     user_args['raw_dump'] = args.raw_dump
 
-    user_args['instance_name'] = args.instance_name
     global INSTANCE_NAME
     INSTANCE_NAME = args.instance_name
 
