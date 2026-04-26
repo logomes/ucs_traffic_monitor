@@ -22,7 +22,6 @@
   "links": [],
   "panels": [
     {
-      "content": "<table style=\"margin-left: auto; margin-right: auto;\" border=\"0\" width=\"100%\">\r\n<tbody>\r\n<tr>\r\n<td style=\"width: 15%;\" valign=\"middle\"><img id='your_logo' style=\"display: block; margin-left: auto; margin-right: auto;\" src='' width=\"300\" />\r\n<script>\r\n  document.getElementById('your_logo').setAttribute('src', 'http://' + window.location.hostname + \"/your_logo.png\");\r\n</script>\r\n</td>\r\n<td style=\"width: 70%;\">\r\n<h1 style=\"text-align: center;\"><span style=\"color: #299c46;\"><strong>Welcome to UCS Traffic Monitoring at Cisco Systems</strong></span></h1>\r\n<h3 style=\"text-align: center;\"><span style=\"color: #FFFFFF;\">Monitoring <span style=\"color: #B877D9;\">$num_domain</span> UCS domains containing <span style=\"color: #B877D9;\">$num_chassis</span> chassis with </span><span style=\"color: #B877D9;\">$num_servers</span>  servers across <span style=\"color: #B877D9;\">$num_locations</span> locations</span></h3>\r\n</td>\r\n<td style=\"width: 15%;\" valign=\"top\"><img id='cisco_logo' style=\"display: block; margin-left: auto; margin-right: auto;\" src='' alt=\"\" width=\"160\" />\r\n<script>\r\n  document.getElementById('cisco_logo').setAttribute('src', 'http://' + window.location.hostname + \"/cisco_logo.png\");\r\n</script>\r\n</td>\r\n</tr>\r\n</tbody>\r\n</table>\r\n<p style=\"text-align: left;\"></p>",
       "datasource": null,
       "gridPos": {
         "h": 3,
@@ -32,8 +31,10 @@
       },
       "id": 2,
       "links": [],
-      "mode": "html",
-      "options": {},
+      "options": {
+        "mode": "markdown",
+        "content": "# Welcome to UCS Traffic Monitoring at Cisco Systems\n\n**Monitoring $num_domain UCS domains containing $num_chassis chassis with $num_servers servers across $num_locations locations**"
+      },
       "timeFrom": null,
       "timeShift": null,
       "title": "",
@@ -922,7 +923,6 @@
     },
     {
       "cacheTimeout": null,
-      "content": "<h3 style=\"text-align: center;\"><span style=\"color: #ffffff;\"><a id='this_system' href=\"\" target=\"_blank\">Click here</a></span></h3>\n<script>\n  document.getElementById('this_system').setAttribute('href', 'http://' + window.location.hostname + \":3000/d/Sve32sDZk/fi-uplink-port-ingress-congestion-monitoring\");\n</script>",
       "datasource": null,
       "gridPos": {
         "h": 2,
@@ -932,8 +932,10 @@
       },
       "id": 23,
       "links": [],
-      "mode": "html",
-      "options": {},
+      "options": {
+        "mode": "markdown",
+        "content": "[Click here to open FI Uplink Port - Ingress Congestion Monitoring](/d/Sve32sDZk/fi-uplink-port-ingress-congestion-monitoring)"
+      },
       "targets": [
         {
           "groupBy": [],
@@ -968,7 +970,6 @@
     },
     {
       "cacheTimeout": null,
-      "content": "<h3 style=\"text-align: center;\"><span style=\"color: #ffffff;\"><a id='this_system_1' href=\"\" target=\"_blank\">Click here</a></span></h3>\n<script>\n  document.getElementById('this_system_1').setAttribute('href', 'http://' + window.location.hostname + \":3000/d/SVO-VNiWk/chassis-pause-frame-monitoring\");\n</script>",
       "datasource": null,
       "gridPos": {
         "h": 2,
@@ -978,8 +979,10 @@
       },
       "id": 32,
       "links": [],
-      "mode": "html",
-      "options": {},
+      "options": {
+        "mode": "markdown",
+        "content": "[Click here to open Chassis PAUSE Frame Monitoring](/d/SVO-VNiWk/chassis-pause-frame-monitoring)"
+      },
       "targets": [
         {
           "groupBy": [],
@@ -1014,7 +1017,6 @@
     },
     {
       "cacheTimeout": null,
-      "content": "<h3 style=\"text-align: center;\"><span style=\"color: #ffffff;\"><a id='this_system_3' href=\"\" target=\"_blank\">Local system health</a></span></h3>\n<script>\n  document.getElementById('this_system_3').setAttribute('href', 'http://' + window.location.hostname + \":3000/d/9CXO3jTWz/local-system-health\");\n</script>",
       "datasource": null,
       "gridPos": {
         "h": 2,
@@ -1024,8 +1026,10 @@
       },
       "id": 31,
       "links": [],
-      "mode": "html",
-      "options": {},
+      "options": {
+        "mode": "markdown",
+        "content": "[Open Local System Health](/d/9CXO3jTWz/local-system-health)"
+      },
       "targets": [
         {
           "groupBy": [],
