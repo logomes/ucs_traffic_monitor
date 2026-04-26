@@ -1,0 +1,28 @@
+# Decrypt UTM credentials at boot.
+# Install to /etc/systemd/system/utm-creds.service.
+#
+# Pairs with utm.service which has:
+#   After=utm-creds.service
+#   Requires=utm-creds.service
+#   EnvironmentFile=/run/utm/creds.env
+
+[Unit]
+Description=Decrypt UTM credentials (SOPS+age)
+After=local-fs.target
+Before=utm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/utm-decrypt-creds.sh
+ExecStop=/bin/rm -f /run/utm/creds.env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/utm
+
+[Install]
+WantedBy=multi-user.target
