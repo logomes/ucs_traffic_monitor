@@ -38,3 +38,26 @@ setup() {
     run bash -c "source '$LIB_PATH'; utm::log warning 'careful' 2>&1 1>/dev/null"
     [[ "$output" =~ WARNING ]]
 }
+
+@test "UTM_DASHBOARDS has 8 entries" {
+    run bash -c "source '$LIB_PATH'; echo \${#UTM_DASHBOARDS[@]}"
+    [ "$status" -eq 0 ]
+    [ "$output" = "8" ]
+}
+
+@test "UTM_DASHBOARDS contains 'locations' key" {
+    run bash -c "source '$LIB_PATH'; echo \${UTM_DASHBOARDS[locations]}"
+    [ "$output" = "ri2OFp4Wz" ]
+}
+
+@test "utm::require_jq succeeds when jq is present" {
+    run bash -c "source '$LIB_PATH'; utm::require_jq; echo ok"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ok ]]
+}
+
+@test "utm::require_jq fails when jq is absent" {
+    # Run the function with PATH that excludes jq.
+    run bash -c "source '$LIB_PATH'; PATH=/nonexistent utm::require_jq"
+    [ "$status" -eq 1 ]
+}

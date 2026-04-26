@@ -41,3 +41,26 @@ utm::confirm() {
     printf '\n' >&2
     [[ "$reply" =~ ^[Yy]$ ]]
 }
+
+# Canonical dashboard UID list. Single source of truth — both the upgrade
+# script and the backup script consume this. Adding a new dashboard means
+# editing one line here.
+declare -gA UTM_DASHBOARDS=(
+    ["locations"]="ri2OFp4Wz"
+    ["domain_overview"]="Inte2EIWk"
+    ["domain_traffic"]="W7LSukHWz"
+    ["chassis_traffic"]="KOM8ZHNWz"
+    ["service_profile"]="Z0M_N1vWz"
+    ["ingress_congestion"]="Sve32sDZk"
+    ["chassis_pause"]="SVO-VNiWk"
+    ["local_sys"]="9CXO3jTWz"
+)
+
+# utm::require_jq
+# Aborts the calling script if jq is not on PATH.
+utm::require_jq() {
+    if ! command -v jq >/dev/null 2>&1; then
+        utm::log error "jq is required but not installed. Install via your package manager (e.g., 'sudo pacman -S jq' or 'sudo yum install jq')."
+        exit 1
+    fi
+}
