@@ -21,3 +21,14 @@ def test_loads_single_domain_with_all_vars(monkeypatch):
             group="production",
         )
     ]
+
+
+def test_exits_when_utm_domains_unset(monkeypatch, capsys):
+    monkeypatch.delenv("UTM_DOMAINS", raising=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        load_domains_from_env({})
+
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "UTM_DOMAINS" in captured.err
