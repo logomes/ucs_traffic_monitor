@@ -58,3 +58,20 @@ def test_exits_when_per_domain_vars_missing(monkeypatch, capsys):
     assert "UTM_dom1_PASS" in err
     assert "UTM_dom1_HOST" not in err
     assert "UTM_dom1_USER" not in err
+
+
+def test_error_message_does_not_leak_existing_values(monkeypatch, capsys):
+    secret_value = "super-secret-password-12345"
+    monkeypatch.setenv("UTM_DOMAINS", "dom1,dom2")
+    monkeypatch.setenv("UTM_dom1_HOST", "10.0.0.10")
+    monkeypatch.setenv("UTM_dom1_USER", "monitoring")
+    monkeypatch.setenv("UTM_dom1_PASS", secret_value)
+    # dom2 missing all vars
+
+    with pytest.raises(SystemExit):
+        load_domains_from_env()
+
+    err = capsys.readouterr().err
+    assert secret_value not in err
+    assert "10.0.0.10" not in err
+    assert "monitoring" not in err
