@@ -76,7 +76,7 @@ services:
       DOMAINS: "10.0.0.10,10.0.0.20"
       LOCATIONS: "Production,DR"
       INFLUX_URL: http://influxdb:8086
-      INFLUX_DB: utm
+      INFLUX_DB: telegraf
     logging:
       driver: json-file
       options:

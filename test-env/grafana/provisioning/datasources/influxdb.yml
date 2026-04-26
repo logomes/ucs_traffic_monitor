@@ -5,7 +5,7 @@ datasources:
     type: influxdb
     access: proxy
     url: http://influxdb:8086
-    database: utm
+    database: telegraf
     isDefault: true
     editable: true
     jsonData:
