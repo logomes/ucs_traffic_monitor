@@ -702,6 +702,11 @@ Alvo: **≥ 80 % em `transform/` e `exporters/`**. Smoke test em `collectors/` c
 
 ## 9. Correções pontuais — antes de qualquer refatoração
 
+> **Status: aplicadas.** Ver [`QUICK_FIXES.md`](QUICK_FIXES.md) para o
+> detalhe de cada uma, o que foi medido e os passos que ainda dependem
+> de ação na VM (apagar os `.pickle` antigos e rodar a auditoria de
+> intervalos). Regressão em `tests/test_quick_fixes.py`.
+
 Cinco itens de baixo risco, alto retorno, independentes do RFC:
 
 1. **F5 — uma palavra.** `:2793`: trocar `per_ru_dict` por `ru_dict`. Elimina a perda total de ciclo em domínios só com blades + FEX.

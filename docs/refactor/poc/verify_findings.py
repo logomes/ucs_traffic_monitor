@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """Reprodução executável dos achados do RFC 2026-09-20.
 
-Cada verificação extrai o código real de `telegraf/ucs_traffic_monitor.py`
-(referência de linha no docstring) e demonstra o defeito. Nenhum acesso a
-UCS é necessário — os achados são determinísticos.
+Cada verificação extrai o código como ele estava quando o achado foi
+registrado (referência de linha no docstring) e demonstra o defeito. Nenhum
+acesso a UCS é necessário — os achados são determinísticos.
+
+IMPORTANTE: este arquivo é o registro histórico dos defeitos. Ele reproduz
+trechos copiados, não importa o coletor, então continua reportando
+REPRODUZIDO mesmo para o que já foi corrigido. Para o estado ATUAL do
+coletor, rode `tests/test_quick_fixes.py`.
+
+Já corrigidos no coletor: F1 e F2 (contidos — arquivo 0600 e recusa de
+carregar arquivo inseguro), F5 e F11. Ainda abertos: F3, F7, F8, F9, F10.
+Ver `docs/refactor/QUICK_FIXES.md`.
 
 Uso:
     python3 docs/refactor/poc/verify_findings.py
