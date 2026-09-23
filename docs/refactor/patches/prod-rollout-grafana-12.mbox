@@ -1,7 +1,7 @@
 From 4befc0f2eb8f3a7b61b7a068814f5af353348578 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 20 Sep 2026 19:40:19 +0000
-Subject: [PATCH 01/12] Add modernization RFC with verified findings and
+Subject: [PATCH 01/13] Add modernization RFC with verified findings and
  reproduction harness
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1230,7 +1230,7 @@ index 0000000..94a7953
 From 54b7f11d91945be94942687a2d884ba94d80789e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 21 Sep 2026 02:00:08 +0000
-Subject: [PATCH 02/12] Apply the five quick fixes from the RFC (section 9)
+Subject: [PATCH 02/13] Apply the five quick fixes from the RFC (section 9)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -2473,7 +2473,7 @@ index 0000000..468ee7a
 From 2e86294745dfa33bd414f32d8ed5aa369205f3c0 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 03:30:46 +0000
-Subject: [PATCH 03/12] Add preflight check and unpin netmiko for modern Python
+Subject: [PATCH 03/13] Add preflight check and unpin netmiko for modern Python
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -2706,7 +2706,7 @@ index 0000000..66bee50
 From be4149116afced6fe4b94557ff5450f51bc95245 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:22:06 +0000
-Subject: [PATCH 04/12] Add validation tooling that works in both credential
+Subject: [PATCH 04/13] Add validation tooling that works in both credential
  modes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -4010,7 +4010,7 @@ index 66bee50..db119df 100755
 From aea563da503866d74ad9065a011d62c0c765a607 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:24:57 +0000
-Subject: [PATCH 05/12] Disable setuptools package discovery so the CI install
+Subject: [PATCH 05/13] Disable setuptools package discovery so the CI install
  step works
 
 `pip install -e .[dev]`, the CI's install step, aborts with "Multiple
@@ -4052,7 +4052,7 @@ index 44c2d99..c266b90 100644
 From 0af85a1e37b33fe92bf37cfea6557440b367bf64 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:24:58 +0000
-Subject: [PATCH 06/12] Require netmiko 4.4+ and match the branch's lint rules
+Subject: [PATCH 06/13] Require netmiko 4.4+ and match the branch's lint rules
 
 - pyproject.toml: netmiko>=4.0 becomes >=4.4.0. Below 4.4, netmiko imports
   the stdlib telnetlib, which Python 3.13 removed, so the collector dies at
@@ -4296,7 +4296,7 @@ index d557591..21d44a6 100644
 From 2e7d96df9d07a53cf7d635e5e2468d1ea99d610f Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:28:29 +0000
-Subject: [PATCH 07/12] Fix two validation verdicts found by end-to-end testing
+Subject: [PATCH 07/13] Fix two validation verdicts found by end-to-end testing
 
 Running collect_validation.sh against simulated hosts in both credential
 modes, as a real telegraf user with a venv, surfaced two ways the report
@@ -4513,7 +4513,7 @@ index 3d83078..016692f 100755
 From e46251a08905323fc8f775484a43d22ab281215c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:31:47 +0000
-Subject: [PATCH 08/12] Keep validation runs from writing bytecode into the
+Subject: [PATCH 08/13] Keep validation runs from writing bytecode into the
  production directory
 
 Pointing the test suite (or preflight) at a production collector imports
@@ -4605,7 +4605,7 @@ index db119df..12b0e45 100755
 From 09effaeebb7a59e158f8e898edc336938fbb052c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:33:32 +0000
-Subject: [PATCH 09/12] Report a missing pickle as such in the validation
+Subject: [PATCH 09/13] Report a missing pickle as such in the validation
  summary
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -4652,7 +4652,7 @@ index 17f71fa..a310add 100755
 From e7658751474666a07016f7bb7da4c1918d1dc1fe Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:46:21 +0000
-Subject: [PATCH 10/12] Refuse to run when the package sits inside the output
+Subject: [PATCH 10/13] Refuse to run when the package sits inside the output
  directory
 
 Extracting the package in /tmp puts it at /tmp/utm-validacao, which is
@@ -4701,7 +4701,7 @@ index a310add..bd450b3 100755
 From f881e59856f3501cbeba28f4a9fa314f32eb4f45 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 11:00:01 +0000
-Subject: [PATCH 11/12] Make preflight find the packaged collector and check
+Subject: [PATCH 11/13] Make preflight find the packaged collector and check
  the interpreter
 
 Run from the validation package, preflight looked only for the repo
@@ -4902,7 +4902,7 @@ index 12b0e45..d6683a7 100755
 From d914846ef06b43f103b3f338308386ecb8f60e8a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 11:35:19 +0000
-Subject: [PATCH 12/12] Handle commented-out commands and several domains files
+Subject: [PATCH 12/13] Handle commented-out commands and several domains files
 
 On a real host with one inputs.exec block per pod and commented-out
 blocks, two things went wrong. Commented commands were read as live, so
@@ -5023,6 +5023,164 @@ index d6683a7..14a5a02 100755
 +                return shlex.split(match.group(1))
      return None
  
+ 
+-- 
+2.43.0
+
+
+From 5d7b939dff791b004ef98c32c7cd4bd60fa32353 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 11:50:39 +0000
+Subject: [PATCH 13/13] Bring the validation docs in line with the tooling
+
+The runbook still said to run preflight with a bare python3 and to
+extract anywhere. It now covers extracting outside /tmp, finding the
+interpreter telegraf runs and running preflight with it, the pip command
+aimed at that interpreter, and how several inputs.exec blocks and
+commented-out commands are handled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+---
+ docs/refactor/QUICK_FIXES.md | 12 ++++----
+ docs/refactor/README.md      |  2 +-
+ docs/refactor/VALIDACAO.md   | 55 ++++++++++++++++++++++++++++--------
+ 3 files changed, 51 insertions(+), 18 deletions(-)
+
+diff --git a/docs/refactor/QUICK_FIXES.md b/docs/refactor/QUICK_FIXES.md
+index bdf2637..4f0bf36 100644
+--- a/docs/refactor/QUICK_FIXES.md
++++ b/docs/refactor/QUICK_FIXES.md
+@@ -153,11 +153,13 @@ SELECT last("success") FROM "UTMCollectorHealth" GROUP BY domain
+ ## Pré-requisito: a máquina consegue rodar o coletor?
+ 
+ ```sh
+-python3 tools/preflight.py
++/caminho/do/python/do/telegraf tools/preflight.py
+ ```
+ 
+-Checa versão de Python, `ucsmsdk`, `netmiko` e a sintaxe do coletor. Não altera
+-nada. Sai 0 se o host está apto.
++Checa versão de Python, se é o mesmo interpretador que o Telegraf chama,
++`ucsmsdk`, `netmiko` e a sintaxe do coletor. Não altera nada. Sai 0 se o host
++está apto. Rodado com outro Python, o resultado não diz nada sobre a produção —
++por isso a comparação com o `telegraf.conf`.
+ 
+ **Por que importa:** netmiko abaixo de 4.4.0 importa o `telnetlib` da stdlib,
+ que o **Python 3.13 removeu**. O playbook deste repositório fixava
+@@ -166,10 +168,10 @@ consegue nem importar o coletor** — morre no startup com `ModuleNotFoundError`
+ e não produz métrica nenhuma. Corrige com:
+ 
+ ```sh
+-python3 -m pip install -U 'netmiko>=4.4.0'
++/caminho/do/python/do/telegraf -m pip install -U 'netmiko>=4.4.0'
+ ```
+ 
+-Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13; 4.4.0 e 4.8.0 passam.
++Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13 (e funcionam até o 3.12); 4.4.0 e 4.8.0 passam.
+ `ucsmsdk` 0.9.27 importa sem problema.
+ 
+ ## Verificação
+diff --git a/docs/refactor/README.md b/docs/refactor/README.md
+index 9eba702..e11a628 100644
+--- a/docs/refactor/README.md
++++ b/docs/refactor/README.md
+@@ -8,7 +8,7 @@
+ | [`../../tests/test_quick_fixes.py`](../../tests/test_quick_fixes.py) | Testes de regressão das correções |
+ | [`VALIDACAO.md`](VALIDACAO.md) | Roteiro de validação na VM, nos dois modos de credencial |
+ | [`../../tools/collect_validation.sh`](../../tools/collect_validation.sh) | Coleta automática do relatório de validação |
+-| [`../../tools/preflight.py`](../../tools/preflight.py) | O host consegue rodar o coletor? (Python, ucsmsdk, netmiko) |
++| [`../../tools/preflight.py`](../../tools/preflight.py) | O host consegue rodar o coletor? (Python do Telegraf, ucsmsdk, netmiko) |
+ | [`../../tools/audit_stats_interval.py`](../../tools/audit_stats_interval.py) | Auditoria dos três intervalos (F6/H1) |
+ | [`../../tools/check_pickle_exposure.py`](../../tools/check_pickle_exposure.py) | Senha em texto claro no `.pickle`? Responde sim/não sem imprimi-la (F1) |
+ | [`../../tools/lp_lint.py`](../../tools/lp_lint.py) | Linhas de Line Protocol que o Telegraf rejeitaria (F3) |
+diff --git a/docs/refactor/VALIDACAO.md b/docs/refactor/VALIDACAO.md
+index 84a8ffd..9c2002e 100644
+--- a/docs/refactor/VALIDACAO.md
++++ b/docs/refactor/VALIDACAO.md
+@@ -19,32 +19,54 @@ invocação da outra.
+ 
+ ## Passo 0 — o host consegue rodar o coletor?
+ 
++Extraia **fora de `/tmp`**: `/tmp/utm-validacao` é o diretório de saída e é
++apagado a cada execução (o script recusa rodar de dentro dele).
++
++```sh
++cd ~ && tar xzf utm-validacao.tar.gz && cd utm-validacao
++sha256sum -c --quiet MANIFEST.sha256 && echo OK
++```
++
++Descubra o Python que o Telegraf usa — o primeiro termo do `commands` nos
++blocos ativos (linhas com `#` estão comentadas e não contam):
++
++```sh
++grep -h -A3 'inputs.exec' /etc/telegraf/telegraf.conf /etc/telegraf/telegraf.d/*.conf \
++    2>/dev/null | grep -A2 commands
++command -v python3.11        # o nome que aparecer, para ter o caminho completo
++```
++
++e rode o preflight **com ele**:
++
+ ```sh
+-cd ~ && tar xzf utm-validacao.tar.gz && cd utm-validacao    # fora de /tmp: /tmp/utm-validacao é a saída
+-python3 tools/preflight.py
++/usr/bin/python3.11 tools/preflight.py
+ ```
+ 
+-Use **o mesmo Python que o Telegraf usa** — o primeiro termo do `commands` no
+-bloco `inputs.exec`. Se for um venv, rode com ele (`/opt/utm-venv/bin/python
+-tools/preflight.py`).
++O preflight lê o `telegraf.conf`, escolhe a variante do coletor que bate com o
++modo de credencial da produção e compara interpretadores: a linha
++`telegraf python` falha, dizendo qual é o certo, se você rodou com outro. O
++resultado só vale para o interpretador do Telegraf — outro Python no mesmo host
++pode ter ou não ter as bibliotecas, e isso não diz nada sobre a produção.
+ 
+ O ponto que costuma falhar em Python 3.13+ é o `netmiko`: abaixo de 4.4.0 ele
+ importa o `telnetlib`, removido no 3.13, e o coletor morre no startup sem
+-produzir métrica. Conserto:
++produzir métrica. Até o 3.12 o netmiko 4.x antigo funciona. Conserto, **no
++interpretador do Telegraf** (o preflight imprime o comando com o caminho
++certo):
+ 
+ ```sh
+-python3 -m pip install -U 'netmiko>=4.4.0'
++/caminho/do/python -m pip install -U ucsmsdk 'netmiko>=4.4.0'
+ ```
+ 
+ No SUSE, se o pip recusar com `externally-managed-environment`, use venv:
+ 
+ ```sh
+-sudo python3 -m venv /opt/utm-venv
+-sudo /opt/utm-venv/bin/pip install -U ucsmsdk 'netmiko>=4.4.0'
++python3.14 -m venv /opt/utm-venv
++/opt/utm-venv/bin/pip install -U ucsmsdk 'netmiko>=4.4.0'
+ ```
+ 
+-e troque `python3` por `/opt/utm-venv/bin/python` no `telegraf.conf` quando
+-for promover.
++e troque o interpretador por `/opt/utm-venv/bin/python` no `telegraf.conf`
++quando for promover.
+ 
+ ## Passo 1 — coleta automática
+ 
+@@ -56,7 +78,16 @@ less /tmp/utm-validacao/relatorio.txt
+ O script descobre sozinho, a partir do `telegraf.conf`: o Python, o usuário do
+ Telegraf, o modo de credencial, o arquivo de domínios ou o `creds.env`, e o
+ dashboard. Qualquer um pode ser forçado por variável — ver o cabeçalho do
+-script.
++script. Blocos e comandos comentados são ignorados.
++
++**Vários blocos `inputs.exec`** (um por pod, por exemplo): a comparação antes ×
++depois da seção 8 roda contra o primeiro bloco ativo — basta um para provar o
++comportamento. A checagem do pickle (seção 5) e a consulta ao UCSM (seção 7)
++usam **todos** os arquivos de domínios, porque cada pod tem o seu `.pickle` e
++cada pickle precisa ser comparado com as senhas que podem estar nele. A união
++dos arquivos fica em `OUT`, legível só pelo usuário do Telegraf, e é apagada ao
++fim da execução. Blocos de outros coletores (o `mds_traffic_monitor`, por
++exemplo) não entram.
+ 
+ O relatório tem, nesta ordem:
  
 -- 
 2.43.0
