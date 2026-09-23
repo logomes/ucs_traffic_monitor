@@ -25,6 +25,10 @@ from __future__ import print_function
 import os
 import sys
 
+# Importing credentials.py next to a production collector must not leave a
+# __pycache__ directory behind there.
+sys.dont_write_bytecode = True
+
 # netmiko below this vendors nothing and needs the stdlib telnetlib
 NETMIKO_MIN_ON_PY313 = (4, 4, 0)
 

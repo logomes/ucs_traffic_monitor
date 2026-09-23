@@ -22,6 +22,10 @@ import types
 from contextlib import redirect_stdout
 from pathlib import Path
 
+# The suite is pointed at production collectors too; importing one must not
+# leave a __pycache__ directory behind in the production directory.
+sys.dont_write_bytecode = True
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # UTM_COLLECTOR points the suite at another copy of the collector, which is
 # how these tests are checked against the pre-fix code: they must fail there.

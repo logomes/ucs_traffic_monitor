@@ -29,6 +29,10 @@
 
 set -u
 
+# Python would otherwise cache bytecode next to every module it imports,
+# including a production collector.
+export PYTHONDONTWRITEBYTECODE=1
+
 PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UTM_DIR="${UTM_DIR:-/usr/local/telegraf}"
 CREDS_FILE="${CREDS_FILE:-/etc/utm/creds.env}"
@@ -152,6 +156,12 @@ cp -r "$PKG_DIR/tools" "$PKG_DIR/tests" "$PKG_DIR/coletor" "$STAGE/"
 chown -R "$TG_USER" "$STAGE"
 NEW_COLLECTOR="$STAGE/coletor/modo-$MODE/ucs_traffic_monitor.py"
 [ -f "$NEW_COLLECTOR" ] || die "variante modo-$MODE ausente no pacote"
+# The suite imports the collector under test (and its credentials.py); a
+# copy keeps that import from touching anything under UTM_DIR.
+mkdir -p "$STAGE/producao"
+cp "$PROD_COLLECTOR" "$STAGE/producao/"
+[ -f "$UTM_DIR/credentials.py" ] && cp "$UTM_DIR/credentials.py" "$STAGE/producao/"
+PROD_COPY="$STAGE/producao/ucs_traffic_monitor.py"
 
 PREFLIGHT_RC=1
 PROD_TESTS="?"
@@ -193,7 +203,7 @@ else
 fi
 
 section "3. testes contra o coletor de PRODUÇÃO (esperado: 0/16)"
-env UTM_COLLECTOR="$PROD_COLLECTOR" "$PY" "$STAGE/tests/test_quick_fixes.py" \
+env UTM_COLLECTOR="$PROD_COPY" "$PY" "$STAGE/tests/test_quick_fixes.py" \
     > "$OUT/tests_producao.txt" 2>&1
 grep -E '^(ok|FAIL) |^ {8}[A-Za-z]+(Error|Exception)' "$OUT/tests_producao.txt"
 PROD_TESTS="$(tail -n1 "$OUT/tests_producao.txt")"
