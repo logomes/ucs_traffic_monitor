@@ -196,7 +196,7 @@ fi
 [ "$EXEC_COUNT" -gt 1 ] && echo "aviso           : mais de um bloco exec do UTM; validando o primeiro"
 
 section "1. preflight (como $TG_USER, com o python do telegraf)"
-as_tg env UTM_COLLECTOR="$NEW_COLLECTOR" "$PY" "$STAGE/tools/preflight.py"
+as_tg env UTM_COLLECTOR="$NEW_COLLECTOR" TELEGRAF_CONF="${TELEGRAF_CONF:-}" "$PY" "$STAGE/tools/preflight.py"
 PREFLIGHT_RC=$?
 
 section "2. integridade do pacote"
