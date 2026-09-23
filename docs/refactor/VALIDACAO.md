@@ -20,7 +20,7 @@ invocação da outra.
 ## Passo 0 — o host consegue rodar o coletor?
 
 ```sh
-tar xzf utm-validacao.tar.gz && cd utm-validacao
+cd ~ && tar xzf utm-validacao.tar.gz && cd utm-validacao    # fora de /tmp: /tmp/utm-validacao é a saída
 python3 tools/preflight.py
 ```
 

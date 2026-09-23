@@ -148,6 +148,10 @@ case "$(basename "$OUT")" in
     *utm*) ;;
     *) die "OUT precisa ter 'utm' no nome (proteção do rm -rf): $OUT" ;;
 esac
+OUT="${OUT%/}"
+case "$PKG_DIR/" in
+    "$OUT"/*) die "o pacote está dentro de OUT ($OUT), que é apagado a cada execução; extraia em outro lugar (ex.: ~/utm-validacao) ou defina OUT=" ;;
+esac
 rm -rf "$OUT"
 install -d -m 0750 -o "$TG_USER" "$OUT"
 STAGE="$OUT/pkg"
