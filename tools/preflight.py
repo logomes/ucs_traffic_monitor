@@ -106,8 +106,12 @@ def telegraf_command():
                 text = handle.read()
         except (IOError, OSError):
             continue
-        for quoted in re.findall(r'"([^"]*ucs_traffic_monitor\.py[^"]*)"', text):
-            return shlex.split(quoted)
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            match = re.search(r'"([^"]*ucs_traffic_monitor\.py[^"]*)"', line)
+            if match:
+                return shlex.split(match.group(1))
     return None
 
 

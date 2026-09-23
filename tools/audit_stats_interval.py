@@ -84,7 +84,10 @@ def read_telegraf_config(paths):
         files = sorted(path.glob("*.conf")) if path.is_dir() else [path]
         for conf in files:
             try:
-                chunks.append(conf.read_text())
+                # Commented-out tables and keys are not what telegraf runs
+                chunks.append("\n".join(
+                    line for line in conf.read_text().splitlines()
+                    if not line.lstrip().startswith("#")))
             except OSError as exc:
                 print(f"  ! cannot read {conf}: {exc}", file=sys.stderr)
     return "\n".join(chunks)

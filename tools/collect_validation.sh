@@ -65,7 +65,9 @@ fi
 # The command telegraf actually runs, from the inputs.exec block
 EXEC_LINES=""
 if [ "${#TELEGRAF_PATHS[@]}" -gt 0 ]; then
-    EXEC_LINES="$(grep -rhoE '"[^"]*ucs_traffic_monitor\.py[^"]*"' "${TELEGRAF_PATHS[@]}" 2>/dev/null | tr -d '"')"
+    # Commented-out commands (# "python3 ...") are not what telegraf runs
+    EXEC_LINES="$(grep -rhE '^[^#]*"[^"]*ucs_traffic_monitor\.py' "${TELEGRAF_PATHS[@]}" 2>/dev/null \
+        | grep -oE '"[^"]*ucs_traffic_monitor\.py[^"]*"' | tr -d '"')"
 fi
 EXEC_COUNT="$(printf '%s\n' "$EXEC_LINES" | grep -c . || true)"
 EXEC_CMD="$(printf '%s\n' "$EXEC_LINES" | head -n1)"
@@ -95,10 +97,16 @@ if [ -z "${DASHBOARD:-}" ]; then
     done
 fi
 
-if [ "$MODE" = env ]; then
-    CRED_ARGS=(--env-file "$CREDS_FILE")
-else
-    CRED_ARGS=(-i "${GRP:-}")
+# Every domains file telegraf uses: one pickle per file, and each must be
+# checked against the passwords that could be inside it.
+ALL_GRPS=()
+if [ "$MODE" = file ]; then
+    while IFS= read -r grp_file; do
+        [ -f "$grp_file" ] && ALL_GRPS+=("$grp_file")
+    done < <(printf '%s\n' "$EXEC_LINES" \
+        | awk '{for (i = 1; i < NF; i++) if ($i ~ /ucs_traffic_monitor\.py$/) {print $(i + 1); break}}' \
+        | sort -u)
+    [ -n "${GRP:-}" ] && [ "${#ALL_GRPS[@]}" -eq 0 ] && ALL_GRPS=("$GRP")
 fi
 
 # --- helpers -----------------------------------------------------------------
@@ -167,6 +175,18 @@ cp "$PROD_COLLECTOR" "$STAGE/producao/"
 [ -f "$UTM_DIR/credentials.py" ] && cp "$UTM_DIR/credentials.py" "$STAGE/producao/"
 PROD_COPY="$STAGE/producao/ucs_traffic_monitor.py"
 
+if [ "$MODE" = env ]; then
+    CRED_ARGS=(--env-file "$CREDS_FILE")
+else
+    # Union of all domains files, readable only by the telegraf user and
+    # removed at the end of the run: it holds the UCS passwords.
+    ALL_DOMAINS="$OUT/.dominios_todos.txt"
+    (umask 077; cat ${ALL_GRPS[@]+"${ALL_GRPS[@]}"} /dev/null > "$ALL_DOMAINS")
+    chown "$TG_USER" "$ALL_DOMAINS"
+    trap 'rm -f "$ALL_DOMAINS"' EXIT
+    CRED_ARGS=(-i "$ALL_DOMAINS")
+fi
+
 PREFLIGHT_RC=1
 PROD_TESTS="?"
 NEW_TESTS="?"
@@ -192,6 +212,10 @@ if [ "$MODE" = env ]; then
 else
     echo "comando telegraf: $EXEC_CMD"
     echo "arquivo domínios: ${GRP:-não encontrado} ($(stat -c '%a %U:%G' "${GRP:-/nonexistent}" 2>&1))"
+    echo "todos os arquivos de domínios (pickle e UCSM):"
+    for grp_file in ${ALL_GRPS[@]+"${ALL_GRPS[@]}"}; do
+        echo "                  $grp_file ($(grep -cE '^[^#].*,.*,' "$grp_file") domínio(s))"
+    done
 fi
 [ "$EXEC_COUNT" -gt 1 ] && echo "aviso           : mais de um bloco exec do UTM; validando o primeiro"
 
