@@ -27,6 +27,13 @@ CONNECTION_REFRESH_INTERVAL = 5400
 CONNECTION_TIMEOUT = 10
 MASTER_TIMEOUT = 48
 
+# The pickled UcsHandle carries the UCS username and password, so the pickle
+# file must never be readable beyond its owner
+PICKLE_FILE_MODE = 0o600
+# Group/other write on the pickle file would let another account choose what
+# pickle.load() executes in this process
+UNSAFE_PICKLE_MODE_BITS = 0o022
+
 user_args = {}
 FILENAME_PREFIX = __file__.replace('.py', '')
 INPUT_FILE_PREFIX = ''
@@ -285,6 +292,84 @@ def get_ucs_domains():
         logger.warning('No UCS domains to monitor. Check input file. Exiting.')
         sys.exit()
 
+def open_pickle_file_for_write(pickle_file_name):
+    """
+    Open the pickle file for writing with owner-only permissions
+
+    The pickled UcsHandle carries the UCS username and password as instance
+    attributes, so this file holds credentials in the clear. Create it as
+    0600 and tighten an existing file before writing, so a file left behind
+    with loose permissions by an older version is not kept readable.
+
+    Parameters:
+    pickle_file_name (path of the pickle file)
+
+    Returns:
+    file object open in 'w+b', or None if it could not be opened
+
+    """
+
+    try:
+        fd = os.open(pickle_file_name,
+                     os.O_RDWR | os.O_CREAT | os.O_TRUNC,
+                     PICKLE_FILE_MODE)
+    except Exception as e:
+        logger.exception('Error in opening {} : {} : {}.' \
+                        .format(pickle_file_name, type(e).__name__, e))
+        return None
+
+    try:
+        # O_CREAT does not change the mode of an existing file
+        os.fchmod(fd, PICKLE_FILE_MODE)
+    except Exception as e:
+        logger.warning('Unable to set mode {:o} on {} : {} : {}' \
+                        .format(PICKLE_FILE_MODE, pickle_file_name, \
+                                type(e).__name__, e))
+
+    return os.fdopen(fd, 'w+b')
+
+def pickle_file_is_safe_to_load(pickle_file_name):
+    """
+    Check that the pickle file can only have been written by its owner
+
+    pickle.load() executes code carried by the data it reads, so loading a
+    file that another account can write hands that account this process.
+    Refuse to load unless the file is owned by this user (or root) and is
+    not writable by group or others.
+
+    Parameters:
+    pickle_file_name (path of the pickle file)
+
+    Returns:
+    True if the file is safe to load, False otherwise
+
+    """
+
+    try:
+        file_stat = os.stat(pickle_file_name)
+    except FileNotFoundError:
+        # Nothing to load. Handled by the caller as a first run
+        return True
+    except Exception as e:
+        logger.warning('Unable to stat {} : {} : {}. Not loading it.' \
+                        .format(pickle_file_name, type(e).__name__, e))
+        return False
+
+    if file_stat.st_uid not in (os.geteuid(), 0):
+        logger.error('{} is owned by uid {}, not by this user ({}) or root.' \
+                     ' Not loading it. Delete it to silence this.' \
+                     .format(pickle_file_name, file_stat.st_uid, os.geteuid()))
+        return False
+
+    unsafe_bits = file_stat.st_mode & UNSAFE_PICKLE_MODE_BITS
+    if unsafe_bits:
+        logger.error('{} is writable beyond its owner (mode {:o}).' \
+                     ' Not loading it. Fix with chmod 600.' \
+                     .format(pickle_file_name, file_stat.st_mode & 0o777))
+        return False
+
+    return True
+
 def unpickle_connections():
     """
     Try to unpickle connections to UCS to re-use open connections
@@ -318,6 +403,13 @@ def unpickle_connections():
     existing_pickled_sessions = {}
     pickle_file_name = FILENAME_PREFIX + '_' + INPUT_FILE_PREFIX + '.pickle'
     sdk_time = 0
+
+    if not pickle_file_is_safe_to_load(pickle_file_name):
+        # Start from no saved sessions rather than loading an untrusted file
+        for domain_ip in domain_dict:
+            pickled_connections[domain_ip] = {'cli': None, 'sdk': None,
+                                              'sdk_time': 0}
+        return
 
     try:
         # Do not open with w+b here. This overwrites the file and gives an
@@ -605,23 +697,40 @@ def cleanup_ucs_connections():
     None
 
     """
+    '''
+    Use .get() and check for None before closing. The 'cli' key is absent
+    when --no-ssh made connect_and_pull_stats() return before setting it,
+    and either handle is None when the login failed. Both cases used to
+    raise here, in the very path that runs when something already went
+    wrong, leaving the other domains' sessions open on UCSM.
+    '''
     for domain_ip, handles in conn_dict.items():
-        cli_handle = handles['cli']
-        sdk_handle = handles['sdk']
+        cli_handle = handles.get('cli')
+        sdk_handle = handles.get('sdk')
         logger.debug('Disconnect/Logout session for {} : CLI : {}, SDK : {}'. \
                     format(domain_ip, cli_handle, sdk_handle))
-        cli_handle.disconnect()
-        sdk_handle.logout()
+        if cli_handle is not None:
+            try:
+                cli_handle.disconnect()
+            except Exception as e:
+                logger.warning('Unable to disconnect CLI session for {}: ' \
+                                '{} : {}'.format(domain_ip, \
+                                                 type(e).__name__, e))
+        if sdk_handle is not None:
+            try:
+                sdk_handle.logout()
+            except Exception as e:
+                logger.warning('Unable to logout SDK session for {}: ' \
+                                '{} : {}'.format(domain_ip, \
+                                                 type(e).__name__, e))
 
     # Write an empty dictionary in pickle_file for next time
     pickle_file_name = FILENAME_PREFIX + '_' + INPUT_FILE_PREFIX + '.pickle'
     empty_dict = {}
 
-    try:
-        pickle_file = open(pickle_file_name, 'w+b')
-    except Exception as e:
-        logger.exception('Error in opening {} : {} : {}. Exit.' \
-                        .format(pickle_file_name, type(e).__name__, e))
+    pickle_file = open_pickle_file_for_write(pickle_file_name)
+    if pickle_file is None:
+        logger.error('Unable to clear {}'.format(pickle_file_name))
     else:
         logger.info('No pickle sessions for next time in {}' \
                         .format(pickle_file_name))
@@ -659,11 +768,10 @@ def pickle_connections():
     for domain_ip, handles in conn_dict.items():
         handles['cli'] = None
 
-    try:
-        pickle_file = open(pickle_file_name, 'w+b')
-    except Exception as e:
-        logger.exception('Error in opening {} : {} : {}. Exit.' \
-                        .format(pickle_file_name, type(e).__name__, e))
+    pickle_file = open_pickle_file_for_write(pickle_file_name)
+    if pickle_file is None:
+        logger.error('Unable to save sessions in {}. Next run opens new ' \
+                     'connections.'.format(pickle_file_name))
     else:
         logger.info('Pickle sessions for next time in {} : {}' \
                         .format(pickle_file_name, conn_dict))
@@ -2790,14 +2898,25 @@ def print_output_in_influxdb_lp():
                             else:
                                 ru_dict = d_dict['ru']
                                 ru_server = per_bp_port_dict['peer']
-                                if ru_server in per_ru_dict:
-                                    per_ru_dict = ru_dict[ru_server]
+                                '''
+                                Look up the peer in ru_dict, not in
+                                per_ru_dict. per_ru_dict is the loop variable
+                                of the rack unit loop above: it is unbound
+                                when the domain has no rack units (blade-only
+                                domain with a FEX), which raises
+                                UnboundLocalError and drops the output of
+                                every domain in this run. Use a separate name
+                                for the peer so the outer loop variable is
+                                never rebound here.
+                                '''
+                                if ru_server in ru_dict:
+                                    peer_ru_dict = ru_dict[ru_server]
                                     bp_tags = bp_tags + \
                                             ',peer_service_profile=' + \
-                                            per_ru_dict['service_profile']
+                                            peer_ru_dict['service_profile']
                                 else:
                                     logger.info('Know peer_type for {} but' \
-                                    ' cannot find it in per_ru_dict' \
+                                    ' cannot find it in ru_dict' \
                                     .format(per_bp_port_dict['peer']))
                     bp_tags, bp_fields = \
                                 influxdb_lp_bp_ports(per_bp_port_dict, \
@@ -2824,6 +2943,55 @@ def print_output():
         logger.info('Printing output in InfluxDB Line Protocol format')
         print_output_in_influxdb_lp()
         logger.info('Printing output - DONE')
+
+def print_collector_health(output_ok, run_duration):
+    """
+    Print one health line per UCS domain, whatever else happened in this run
+
+    Without this, a failed collection and a domain with no traffic look
+    exactly the same in Grafana: both are simply missing series. This must
+    stay cheap and defensive, because it runs after a failure too. It emits
+    no tag other than the domain IP, which needs no Line Protocol escaping.
+
+    Parameters:
+    output_ok (False if printing the stats raised)
+    run_duration (seconds taken by this run)
+
+    Returns:
+    None
+
+    """
+
+    if user_args.get('output_format') != 'influxdb-lp' or \
+            user_args.get('verify_only'):
+        return
+
+    no_ssh = bool(user_args.get('no_ssh'))
+    health_lines = ''
+
+    for domain_ip in domain_dict:
+        sdk_ok = bool(raw_sdk_stats.get(domain_ip))
+        cli_ok = True if no_ssh else bool(raw_cli_stats.get(domain_ip))
+        collection_ok = sdk_ok and cli_ok
+        success = collection_ok and output_ok
+
+        health_lines = health_lines + \
+            'UTMCollectorHealth,domain=' + domain_ip + \
+            ' success=' + ('1i' if success else '0i') + \
+            ',sdk_ok=' + ('1i' if sdk_ok else '0i') + \
+            ',cli_ok=' + ('1i' if cli_ok else '0i') + \
+            ',cli_skipped=' + ('1i' if no_ssh else '0i') + \
+            ',output_ok=' + ('1i' if output_ok else '0i') + \
+            ',run_duration=' + str(round(run_duration, 3)) + \
+            ',collector_ver="' + __version__ + '"' + '\n'
+
+        if not success:
+            logger.warning('Collection unhealthy for {}: sdk_ok={}, ' \
+                           'cli_ok={}, output_ok={}'.format(domain_ip, \
+                            sdk_ok, cli_ok, output_ok))
+
+    if health_lines:
+        print(health_lines, end='')
 
 ###############################################################################
 # END: Output functions
@@ -2858,18 +3026,39 @@ def main(argv):
 
     connect_time = time.time()
 
-    # Parse the stats returned by UCS
-    update_stats_dict()
+    '''
+    Parse the stats returned by UCS. Wrapped like get_ucs_stats() and
+    print_output() are: an exception here used to kill the process, which
+    lost the run for every domain AND skipped pickle_connections(), leaving
+    the UCS sessions of this run open until they timed out.
+    '''
+    try:
+        update_stats_dict()
+    except Exception as e:
+        logger.exception('Exception with update_stats_dict:{}' \
+                         .format((str)(e)))
 
     parse_time = time.time()
 
     # Print the stats as per the desired output format
+    output_ok = True
     try:
         print_output()
     except Exception as e:
+        output_ok = False
         logger.exception('Exception with print_output:{}'.format((str)(e)))
 
     output_time = time.time()
+
+    '''
+    Report collection health whatever happened above, so that a failed run
+    is distinguishable from a quiet one in the time series
+    '''
+    try:
+        print_collector_health(output_ok, (output_time - start_time))
+    except Exception as e:
+        logger.exception('Exception with print_collector_health:{}' \
+                         .format((str)(e)))
 
     # Final tasks
     pickle_connections()

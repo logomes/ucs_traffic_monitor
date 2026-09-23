@@ -40,11 +40,18 @@
     register: shell_pip_install
     changed_when: '"Requirement already satisfied: ucsmsdk" not in shell_pip_install.stdout'
 
-  - name: Install netmiko==4.0.0 via pip using shell (ansible module is failing on CentOS7)
+  # netmiko below 4.4.0 imports the stdlib telnetlib, which Python 3.13
+  # removed, so the old netmiko==4.0.0 pin makes the collector fail at import
+  # on a modern host. 4.4.0 vendors telnetlib as netmiko._telnetlib.
+  # Python 3.6 (CentOS 7) cannot install 4.4.0, so keep the old pin there.
+  - name: Install netmiko via pip using shell (ansible module is failing on CentOS7)
     shell:
-      cmd: python3 -m pip install netmiko==4.0.0  # Required to use python 3.6
+      cmd: >
+        python3 -m pip install
+        {{ 'netmiko==4.0.0' if ansible_python_version is version('3.7', '<')
+           else 'netmiko>=4.4.0' }}
     register: shell_pip_install
-    changed_when: '"Requirement already satisfied: netmiko==4.0.0" not in shell_pip_install.stdout'
+    changed_when: '"Requirement already satisfied" not in shell_pip_install.stdout'
 
 
   - name: Enable service chronyd
