@@ -8,7 +8,7 @@
 | [`../../tests/test_quick_fixes.py`](../../tests/test_quick_fixes.py) | Testes de regressão das correções |
 | [`VALIDACAO.md`](VALIDACAO.md) | Roteiro de validação na VM, nos dois modos de credencial |
 | [`../../tools/collect_validation.sh`](../../tools/collect_validation.sh) | Coleta automática do relatório de validação |
-| [`../../tools/preflight.py`](../../tools/preflight.py) | O host consegue rodar o coletor? (Python, ucsmsdk, netmiko) |
+| [`../../tools/preflight.py`](../../tools/preflight.py) | O host consegue rodar o coletor? (Python do Telegraf, ucsmsdk, netmiko) |
 | [`../../tools/audit_stats_interval.py`](../../tools/audit_stats_interval.py) | Auditoria dos três intervalos (F6/H1) |
 | [`../../tools/check_pickle_exposure.py`](../../tools/check_pickle_exposure.py) | Senha em texto claro no `.pickle`? Responde sim/não sem imprimi-la (F1) |
 | [`../../tools/lp_lint.py`](../../tools/lp_lint.py) | Linhas de Line Protocol que o Telegraf rejeitaria (F3) |

@@ -19,32 +19,54 @@ invocação da outra.
 
 ## Passo 0 — o host consegue rodar o coletor?
 
+Extraia **fora de `/tmp`**: `/tmp/utm-validacao` é o diretório de saída e é
+apagado a cada execução (o script recusa rodar de dentro dele).
+
 ```sh
-cd ~ && tar xzf utm-validacao.tar.gz && cd utm-validacao    # fora de /tmp: /tmp/utm-validacao é a saída
-python3 tools/preflight.py
+cd ~ && tar xzf utm-validacao.tar.gz && cd utm-validacao
+sha256sum -c --quiet MANIFEST.sha256 && echo OK
 ```
 
-Use **o mesmo Python que o Telegraf usa** — o primeiro termo do `commands` no
-bloco `inputs.exec`. Se for um venv, rode com ele (`/opt/utm-venv/bin/python
-tools/preflight.py`).
+Descubra o Python que o Telegraf usa — o primeiro termo do `commands` nos
+blocos ativos (linhas com `#` estão comentadas e não contam):
+
+```sh
+grep -h -A3 'inputs.exec' /etc/telegraf/telegraf.conf /etc/telegraf/telegraf.d/*.conf \
+    2>/dev/null | grep -A2 commands
+command -v python3.11        # o nome que aparecer, para ter o caminho completo
+```
+
+e rode o preflight **com ele**:
+
+```sh
+/usr/bin/python3.11 tools/preflight.py
+```
+
+O preflight lê o `telegraf.conf`, escolhe a variante do coletor que bate com o
+modo de credencial da produção e compara interpretadores: a linha
+`telegraf python` falha, dizendo qual é o certo, se você rodou com outro. O
+resultado só vale para o interpretador do Telegraf — outro Python no mesmo host
+pode ter ou não ter as bibliotecas, e isso não diz nada sobre a produção.
 
 O ponto que costuma falhar em Python 3.13+ é o `netmiko`: abaixo de 4.4.0 ele
 importa o `telnetlib`, removido no 3.13, e o coletor morre no startup sem
-produzir métrica. Conserto:
+produzir métrica. Até o 3.12 o netmiko 4.x antigo funciona. Conserto, **no
+interpretador do Telegraf** (o preflight imprime o comando com o caminho
+certo):
 
 ```sh
-python3 -m pip install -U 'netmiko>=4.4.0'
+/caminho/do/python -m pip install -U ucsmsdk 'netmiko>=4.4.0'
 ```
 
 No SUSE, se o pip recusar com `externally-managed-environment`, use venv:
 
 ```sh
-sudo python3 -m venv /opt/utm-venv
-sudo /opt/utm-venv/bin/pip install -U ucsmsdk 'netmiko>=4.4.0'
+python3.14 -m venv /opt/utm-venv
+/opt/utm-venv/bin/pip install -U ucsmsdk 'netmiko>=4.4.0'
 ```
 
-e troque `python3` por `/opt/utm-venv/bin/python` no `telegraf.conf` quando
-for promover.
+e troque o interpretador por `/opt/utm-venv/bin/python` no `telegraf.conf`
+quando for promover.
 
 ## Passo 1 — coleta automática
 
@@ -56,7 +78,16 @@ less /tmp/utm-validacao/relatorio.txt
 O script descobre sozinho, a partir do `telegraf.conf`: o Python, o usuário do
 Telegraf, o modo de credencial, o arquivo de domínios ou o `creds.env`, e o
 dashboard. Qualquer um pode ser forçado por variável — ver o cabeçalho do
-script.
+script. Blocos e comandos comentados são ignorados.
+
+**Vários blocos `inputs.exec`** (um por pod, por exemplo): a comparação antes ×
+depois da seção 8 roda contra o primeiro bloco ativo — basta um para provar o
+comportamento. A checagem do pickle (seção 5) e a consulta ao UCSM (seção 7)
+usam **todos** os arquivos de domínios, porque cada pod tem o seu `.pickle` e
+cada pickle precisa ser comparado com as senhas que podem estar nele. A união
+dos arquivos fica em `OUT`, legível só pelo usuário do Telegraf, e é apagada ao
+fim da execução. Blocos de outros coletores (o `mds_traffic_monitor`, por
+exemplo) não entram.
 
 O relatório tem, nesta ordem:
 

@@ -153,11 +153,13 @@ SELECT last("success") FROM "UTMCollectorHealth" GROUP BY domain
 ## Pré-requisito: a máquina consegue rodar o coletor?
 
 ```sh
-python3 tools/preflight.py
+/caminho/do/python/do/telegraf tools/preflight.py
 ```
 
-Checa versão de Python, `ucsmsdk`, `netmiko` e a sintaxe do coletor. Não altera
-nada. Sai 0 se o host está apto.
+Checa versão de Python, se é o mesmo interpretador que o Telegraf chama,
+`ucsmsdk`, `netmiko` e a sintaxe do coletor. Não altera nada. Sai 0 se o host
+está apto. Rodado com outro Python, o resultado não diz nada sobre a produção —
+por isso a comparação com o `telegraf.conf`.
 
 **Por que importa:** netmiko abaixo de 4.4.0 importa o `telnetlib` da stdlib,
 que o **Python 3.13 removeu**. O playbook deste repositório fixava
@@ -166,10 +168,10 @@ consegue nem importar o coletor** — morre no startup com `ModuleNotFoundError`
 e não produz métrica nenhuma. Corrige com:
 
 ```sh
-python3 -m pip install -U 'netmiko>=4.4.0'
+/caminho/do/python/do/telegraf -m pip install -U 'netmiko>=4.4.0'
 ```
 
-Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13; 4.4.0 e 4.8.0 passam.
+Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13 (e funcionam até o 3.12); 4.4.0 e 4.8.0 passam.
 `ucsmsdk` 0.9.27 importa sem problema.
 
 ## Verificação
