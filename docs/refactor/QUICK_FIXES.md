@@ -143,11 +143,36 @@ SELECT last("success") FROM "UTMCollectorHealth" GROUP BY domain
 
 ---
 
+## Pré-requisito: a máquina consegue rodar o coletor?
+
+```sh
+python3 tools/preflight.py
+```
+
+Checa versão de Python, `ucsmsdk`, `netmiko` e a sintaxe do coletor. Não altera
+nada. Sai 0 se o host está apto.
+
+**Por que importa:** netmiko abaixo de 4.4.0 importa o `telnetlib` da stdlib,
+que o **Python 3.13 removeu**. O playbook deste repositório fixava
+`netmiko==4.0.0`, então um host em Python 3.13+ que seguiu o playbook **não
+consegue nem importar o coletor** — morre no startup com `ModuleNotFoundError`
+e não produz métrica nenhuma. Corrige com:
+
+```sh
+python3 -m pip install -U 'netmiko>=4.4.0'
+```
+
+Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13; 4.4.0 e 4.8.0 passam.
+`ucsmsdk` 0.9.27 importa sem problema.
+
 ## Verificação
 
 ```sh
 python3 tests/test_quick_fixes.py      # 16/16
 ```
+
+Validado em Python 3.11 e 3.13. O coletor e as ferramentas não usam sintaxe
+posterior ao 3.6, então rodam em toda a faixa 3.6 → 3.13+.
 
 Os testes importam o coletor real com `ucsmsdk`/`netmiko` stubados, então não
 precisam de UCS nem de dependências externas. Para provar que pegam os bugs,
