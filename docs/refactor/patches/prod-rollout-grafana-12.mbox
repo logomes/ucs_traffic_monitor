@@ -1,0 +1,4511 @@
+From 4befc0f2eb8f3a7b61b7a068814f5af353348578 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 20 Sep 2026 19:40:19 +0000
+Subject: [PATCH 1/7] Add modernization RFC with verified findings and
+ reproduction harness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Análise técnica do coletor (telegraf/ucs_traffic_monitor.py v0.52) com 12
+achados confirmados por leitura de código e reprodução executável, mais a
+arquitetura-alvo e um plano de migração em 6 fases por strangler pattern.
+
+Achados críticos:
+- F1: o .pickle de sessões grava a senha do UCS em texto claro, o que torna
+  a migração para env vars parcial enquanto o pickle existir
+- F2: pickle.load() sobre arquivo gravável permite execução de código
+- F3: Line Protocol é montado por concatenação sem escape, então a descrição
+  de porta do UCSM injeta linhas arbitrárias na TSDB
+
+Achados altos:
+- F4: output acumulado em string única e impresso fora do loop de domínios,
+  então qualquer exceção descarta o ciclo inteiro de todos os domínios
+- F5: variável de loop vazada em print_output_in_influxdb_lp() gera
+  UnboundLocalError em domínio sem rack units
+- F6: a conversão delta->taxa depende de três configurações independentes
+  (stat policy do UCSM, intervalo do Telegraf, variável do dashboard) que
+  ninguém valida; timeCollected/intervals existem nos MOs e são ignorados
+- F7: iom_slot_id vaza entre iterações do parser de PFC, atribuindo
+  contadores de PAUSE ao IOM errado
+
+docs/refactor/poc/verify_findings.py reproduz 8 dos 12 achados sem acesso a
+UCS; os demais são verificáveis por leitura, com referência de linha.
+Hipóteses não confirmadas ficam separadas dos fatos na seção 5 do RFC.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+(cherry picked from commit 4113358eb32a529443ffc4d1d31adc1fd2102566)
+---
+ .../2026-09-20-utm-modernization-rfc.md       | 791 ++++++++++++++++++
+ docs/refactor/README.md                       |  40 +
+ docs/refactor/poc/verify_findings.py          | 329 ++++++++
+ 3 files changed, 1160 insertions(+)
+ create mode 100644 docs/refactor/2026-09-20-utm-modernization-rfc.md
+ create mode 100644 docs/refactor/README.md
+ create mode 100644 docs/refactor/poc/verify_findings.py
+
+diff --git a/docs/refactor/2026-09-20-utm-modernization-rfc.md b/docs/refactor/2026-09-20-utm-modernization-rfc.md
+new file mode 100644
+index 0000000..506fd97
+--- /dev/null
++++ b/docs/refactor/2026-09-20-utm-modernization-rfc.md
+@@ -0,0 +1,791 @@
++# RFC — Análise técnica e refatoração do UCS Traffic Monitor (UTM)
++
++**Data:** 2026-09-20
++**Status:** Proposta para revisão
++**Autor:** lucgomes
++**Alvo da análise:** `telegraf/ucs_traffic_monitor.py` v0.52 (2.960 linhas), stack de runtime e dashboards
++**Relacionado:** `docs/superpowers/specs/2026-04-25-utm-credentials-design.md` (credenciais — aprovado, incorporado como Fase 1)
++
++---
++
++## 0. Metodologia
++
++Toda afirmação deste documento é **verificada**, não inferida. Os achados da Parte I foram confirmados por um destes três meios, indicados em cada item:
++
++- **[código]** — leitura direta com referência `arquivo:linha`
++- **[PoC]** — reprodução executável do defeito, com o código real extraído do projeto
++- **[medido]** — contagem/medição sobre o repositório
++
++Achados não confirmados aparecem separados na seção 5 como **hipóteses a validar em campo** — não estão misturados aos fatos.
++
++---
++
++## 1. Sumário executivo
++
++O UTM resolve um problema que nenhuma ferramenta de mercado resolve pronta: correlação end-to-end de vNIC/vHBA até a porta de uplink da FI. Esse valor está intacto e deve ser preservado integralmente.
++
++O que a análise mostra, porém, é que o projeto tem **defeitos de correção de dado e de disponibilidade que não são visíveis em operação** — nenhum deles gera erro na tela, todos degradam silenciosamente. Não são consequência de código "antigo": são consequência estrutural de três escolhas (estado global mutável, serialização manual de Line Protocol por concatenação de strings, e ausência de isolamento de falha entre domínios).
++
++Sete achados confirmados, três deles críticos:
++
++| # | Achado | Sev. | Prova |
++|---|---|---|---|
++| F1 | O arquivo `.pickle` contém a senha do UCS **em texto claro** | Crítica | PoC |
++| F2 | `pickle.load()` de arquivo gravável = execução de código arbitrário | Crítica | código |
++| F3 | Injeção de Line Protocol via descrição de porta do UCSM | Crítica | PoC |
++| F4 | Uma exceção em qualquer ponto do output descarta o ciclo inteiro, de **todos** os domínios | Alta | código |
++| F5 | `UnboundLocalError` real em `print_output_in_influxdb_lp()` (variável de loop vazada) | Alta | código |
++| F6 | Taxa de banda depende de 3 configurações não sincronizadas — erro silencioso de escala | Alta | código |
++| F7 | `iom_slot_id` vaza entre iterações → contadores de PAUSE atribuídos ao IOM errado | Alta | código |
++
++Mais quatro de severidade média (F8–F11, seção 4).
++
++A proposta é reescrita incremental por *strangler pattern*, com **harness de paridade como critério de aceite bloqueante** em cada passo. Estimativa: ~14 semanas-pessoa em 6 fases entregáveis de forma independente. Há também 5 correções pontuais (seção 8) que valem mesmo que o RFC inteiro seja recusado.
++
++---
++
++# PARTE I — ANÁLISE
++
++## 2. Perfil do código **[medido]**
++
++```
++2.960  linhas em um único arquivo
++   26  declarações `global`
++    0  type hints
++    0  testes
++    0  arquivos de CI
++  141  chamadas `.format()`  vs  6 f-strings
++  308  ramos `if`/`elif`
++   15  blocos `except Exception` genéricos
++```
++
++Cinco funções concentram 1.170 linhas (40 % do arquivo):
++
++| Função | Linhas | Responsabilidades acumuladas |
++|---|---|---|
++| `print_output_in_influxdb_lp()` | 332 | percorre 5 hierarquias, resolve peers, monta tags, serializa, imprime |
++| `parse_fi_stats()` | 250 | 11 class IDs, FC + Ethernet + port-channels |
++| `parse_backplane_port_stats()` | 225 | correlação IOM ↔ FI ↔ VIF |
++| `parse_pfc_stats()` | 198 | parsing de saída NX-OS |
++| `parse_raw_sdk_stats()` | 165 | dispatcher por `class_id` |
++
++Os números por si só são só dívida técnica. O que importa é o que eles **causam** — a seção 3.
++
++---
++
++## 3. Achados críticos e altos
++
++### F1 — O `.pickle` armazena a senha do UCS em texto claro **[PoC]**
++
++`pickle_connections()` (`telegraf/ucs_traffic_monitor.py:631`) serializa `conn_dict`, que contém objetos `UcsHandle`. O `UcsSession.__init__` guarda a senha como atributo de instância:
++
++```python
++# ucsmsdk/ucssession.py
++def __init__(self, ip, username, password, ...):
++    self.__ip = ip
++    self.__username = username
++    self.__password = password        # ← vai junto no pickle
++```
++
++Reprodução executada com o `ucsmsdk` real:
++
++```python
++>>> h = UcsHandle('10.1.1.1', 'svc_utm_ro', 'SuperSecret123!')
++>>> blob = pickle.dumps(h)
++>>> b'SuperSecret123!' in blob
++True
++>>> [s for s in re.findall(rb'[ -~]{8,}', blob) if b'Secret' in s or b'svc_utm' in s]
++[b'svc_utm_ro', b'SuperSecret123!']
++```
++
++**Impacto:** o `.pickle` fica no diretório de trabalho do Telegraf, entra em snapshot de VM e em backup para storage externo — exatamente o vetor que a spec de credenciais (`2026-04-25`) existe para fechar. **Migrar as credenciais para env vars sem remover o `pickle` não resolve o problema**: a senha continua sendo escrita em disco a cada 60 segundos.
++
++Verificação na VM de produção:
++
++```sh
++sudo strings /usr/local/telegraf/ucs_traffic_monitor_*.pickle | grep -A2 -i 'passw'
++```
++
++**Correção:** eliminar o `pickle` (ADR-06). É pré-requisito da Fase 1, não item opcional.
++
++---
++
++### F2 — `pickle.load()` em arquivo gravável é execução de código arbitrário **[código]**
++
++`unpickle_connections()` (`:288-340`) faz `pickle.load()` sobre um caminho derivado de `FILENAME_PREFIX + '_' + INPUT_FILE_PREFIX + '.pickle'`, relativo ao diretório de trabalho do processo Telegraf. `pickle` executa `__reduce__` durante a desserialização — por construção, quem escreve no arquivo executa código como o usuário do Telegraf.
++
++Agravante: o tratamento de erro de `pickle.load()` só captura `EOFError` e `Exception`; um payload malicioso *bem-formado* não gera erro nenhum.
++
++**Correção:** mesma de F1 — remover. Enquanto não for removido: `chmod 600` e dono restrito ao usuário do Telegraf.
++
++---
++
++### F3 — Injeção de Line Protocol via descrição de porta do UCSM **[PoC]**
++
++Todo o Line Protocol é construído por concatenação de strings, **sem nenhum escape**. O caso mais grave está em `:2563`:
++
++```python
++fi_port_fields = fi_port_fields + \
++    'admin_state="' + per_fi_port_dict['admin_state'] + '",' + \
++    'description="' + per_fi_port_dict['name'] + '",' + \   # ← sem escape
++    'oper_speed=' + (str)(per_fi_port_dict['oper_speed']) + ',' + \
++    'oper_state="' + (str)(per_fi_port_dict['oper_state']) + '"'
++```
++
++`per_fi_port_dict['name']` vem de `fill_fi_port_common_items()` (`:721`), cujo próprio comentário diz: `# name carries description`. É o campo de **descrição da porta, editável por qualquer administrador do UCSM**, que aceita espaços, vírgulas, aspas e barras.
++
++Reprodução com a construção de linha real do projeto:
++
++```
++=== 1. descrição normal ===
++FIUplinkPortStats,domain=10.1.1.1,fi_id=A,...  description="Uplink para Nexus 93180 Po10",...
++
++=== 2. descrição com aspas — linha malformada ===
++... description="link "backup"",oper_speed=10,...
++
++=== 3. injeção: descrição = 'x",fake=1\nFIUplinkPortStats,... bytes_rx_delta=999999999i\nz="'
++FIUplinkPortStats,domain=10.1.1.1,... description="x",fake=1
++FIUplinkPortStats,domain=10.1.1.1,fi_id=A,port=99/99 bytes_rx_delta=999999999i   ← linha forjada
++z="",oper_speed=10,oper_state="up"
++--- linhas geradas: 3 (esperado: 1)
++```
++
++**Impacto, em ordem de probabilidade:**
++
++1. **Disponibilidade (provável hoje):** basta uma descrição de porta com aspas para produzir linha malformada. O Telegraf descarta a linha; dependendo do parser, a rejeição pode atingir o lote.
++2. **Integridade:** um administrador do UCSM pode escrever métricas arbitrárias na TSDB — medições falsas, tags forjadas, valores inventados. O UTM vira canal de escrita não autenticado para a TSDB.
++3. **Cardinalidade:** tags injetadas explodem o índice do InfluxDB.
++
++O mesmo defeito, em menor grau, atinge `,location=` (`:2508`), alimentado pelo texto entre `[` `]` do arquivo de entrada. Um `[Sao Paulo DC1]` gera `location=Sao Paulo DC1` — o espaço **termina o conjunto de tags** no Line Protocol e quebra a linha. O `README` não documenta essa restrição.
++
++**Correção:** serialização por biblioteca, nunca por concatenação (`influxdb-client` / `line-protocol`), ou função de escape única aplicada a todo valor de tag e field string. Na arquitetura-alvo isso vira responsabilidade exclusiva de `exporters/`.
++
++---
++
++### F4 — Nenhum isolamento de falha: uma exceção derruba o ciclo inteiro **[código]**
++
++Duas decisões estruturais se combinam:
++
++1. `print_output_in_influxdb_lp()` acumula **tudo** em `final_print_string` e executa **um único `print()`** na linha `:2810`, fora do loop de domínios que começa em `:2490`.
++2. Em `main()` (`:2839`), `update_stats_dict()` é chamada **sem `try/except`** — diferente de `get_ucs_stats()` e `print_output()`, que têm.
++
++Consequências:
++
++- Qualquer exceção em qualquer ponto das 332 linhas do output → `print()` nunca executa → **Telegraf recebe stdout vazio → zero métricas para todos os domínios daquele grupo naquele ciclo**.
++- Qualquer exceção no parsing → processo morre → além de perder o ciclo, **`pickle_connections()` e `cleanup_ucs_connections()` não rodam** → sessões SDK/SSH ficam órfãs no UCSM.
++
++O UCSM limita sessões por usuário (padrão 32). O ciclo vicioso é: degradação → exceção → sessões órfãs → esgotamento do limite → login recusado → apagão total de monitoração. E como não existe nenhuma métrica sobre a saúde da coleta, **isso é indistinguível de "as portas estão sem tráfego"** no Grafana.
++
++**Correção:** isolamento por domínio (um `TaskGroup` por domínio, falha contida), *streaming* incremental do output em vez de acumulação, e meta-métricas sempre emitidas — inclusive, principalmente, em falha.
++
++---
++
++### F5 — `UnboundLocalError` confirmado no caminho de FEX **[código]**
++
++`print_output_in_influxdb_lp()`, linhas `:2791-2797`:
++
++```python
++ru_dict = d_dict['ru']
++ru_server = per_bp_port_dict['peer']
++if ru_server in per_ru_dict:          # ← BUG: deveria ser `in ru_dict`
++    per_ru_dict = ru_dict[ru_server]
++    bp_tags = bp_tags + ',peer_service_profile=' + per_ru_dict['service_profile']
++```
++
++`per_ru_dict` é vinculado **somente** pelo loop da linha `:2711` (`for ru_id, per_ru_dict in ru_dict.items()`). No ponto `:2793` ele é uma variável de loop vazada. Dois modos de falha:
++
++- **Domínio sem rack servers** (`d_dict['ru']` vazio — caso comum em ambiente só de blades): o loop de `:2711` nunca executa, `per_ru_dict` **nunca é vinculado** → `UnboundLocalError` → por F4, **o ciclo inteiro é perdido, para todos os domínios do grupo**.
++- **Domínio com rack servers:** `per_ru_dict` contém o dicionário do *último* rack unit iterado (chaves `service_profile`, `adaptors`, …), não o dicionário indexado por nome. O teste `ru_server in per_ru_dict` é quase sempre falso → a tag `peer_service_profile` **nunca é emitida** para portas de backplane de FEX. Silencioso. E a linha `:2794` ainda **rebind** `per_ru_dict`, corrompendo as iterações seguintes.
++
++Gatilho: domínio com FEX cuja porta de backplane tem `peer_type` conhecido e diferente de `S-chassis`.
++
++**Correção imediata:** trocar `per_ru_dict` por `ru_dict` na linha `:2793`. Uma palavra.
++
++---
++
++### F6 — A taxa de banda depende de três configurações não sincronizadas **[código]**
++
++Este é o achado mais importante para a **confiabilidade do dado**, e o menos visível.
++
++O UTM **não calcula taxa**. Ele lê o delta que o próprio UCSM já computou (`:1436`, `:1462`, `:1474`, `:1704`, `:1843`, `:1855`):
++
++```python
++port_dict['bytes_rx_delta'] = item.bytes_rx_delta      # delta calculado pelo UCSM
++port_dict['bytes_rx_delta'] = item.total_bytes_delta
++```
++
++Esse delta é computado pelo UCSM sobre **o intervalo da stat collection policy dele** — adapter, chassis, host, port e server têm políticas independentes, tipicamente 1 ou 2 minutos.
++
++A conversão para bits/s acontece só no Grafana, e divide por uma **constante de dashboard**:
++
++```sql
++SELECT max("bytes_rx_delta")/[[polling_interval]] AS "RX"
++FROM "FIUplinkPortStats" WHERE ... GROUP BY time([[__interval_ms]]ms),fi_id,port
++```
++
++(41 queries em `domain_traffic.json` usam `bytes_rx_delta` dessa forma.)
++
++Ou seja, **todo número de largura de banda do UTM só está correto se três valores configurados de forma independente coincidirem**:
++
++```
++ intervalo da stat collection policy no UCSM   (configurado no UCSM, por tipo de stat)
++                  ==
++ intervalo do inputs.exec do Telegraf          (configurado em telegraf.conf)
++                  ==
++ variável [[polling_interval]] do dashboard    (configurada no Grafana)
++```
++
++Ninguém valida essa igualdade. Se a policy de `port` estiver em 2 min e `polling_interval` = 60, **todo gráfico de banda de uplink mostra o dobro do valor real** — sem erro, sem aviso, sem sintoma. O inverso (policy mais rápida que o scrape) descarta amostras.
++
++Agravante: o UCSM expõe `timeCollected` e `intervals` nos próprios MOs de estatística. **O script não lê nenhum dos dois** — a informação necessária para normalizar corretamente está disponível e é ignorada.
++
++**Correção:** o coletor lê `timeCollected`/`intervals`, normaliza para taxa por segundo na origem, e exporta bits/s. O dashboard deixa de ter aritmética. Some a classe inteira de erro. Ver `transform/rates.py` na seção 6.4.
++
++---
++
++### F7 — `iom_slot_id` vaza entre linhas → PAUSE atribuído ao IOM errado **[código]**
++
++Em `parse_pfc_stats()`, `iom_slot_id = 0` é inicializado uma vez por chamada (`:2162`) e o bloco que o resolve aparece duplicado (`:2211` e `:2281`):
++
++```python
++for iom_slot, port_dict in bp_port_dict.items():
++    for iom_port, per_bp_port_dict in port_dict.items():
++        if per_bp_port_dict['fi_id'] == fi_id:
++            iom_slot_id = iom_slot        # só atribui quando casa
++        else:
++            pass
++        break
++...
++iom_slot_dict = bp_port_dict[iom_slot_id]   # KeyError se nada casou
++```
++
++`iom_slot_id` tem escopo de função e **só é atualizado quando encontra correspondência**. Duas falhas:
++
++- **Primeira linha sem correspondência:** `iom_slot_id` continua `0` → `bp_port_dict[0]` → `KeyError` → por F4, processo morto, ciclo perdido, sessões órfãs.
++- **Linha subsequente sem correspondência (pior):** `iom_slot_id` retém o valor da **linha anterior** → os contadores `pause_rx`/`pause_tx` daquela porta são gravados no **IOM errado**. Sem erro, sem log. Corrupção silenciosa exatamente nas dashboards de congestionamento (`chassis_pause.json`, `ingress_congestion.json`) — que são o caso de uso onde o dado precisa ser confiável.
++
++**Correção:** resolver o slot em função pura que retorna `str | None`, tratar `None` explicitamente, e eliminar a duplicação.
++
++**Nota de correção à primeira versão desta análise:** eu havia classificado `parse_pfc_stats()` como parser posicional por coluna. Está errado — ele usa `lines.split()` com guarda `len(line) < 5` e índices `line[-2]`/`line[-1]`, o que é razoavelmente robusto a mudanças de largura de coluna. O defeito real é o vazamento de `iom_slot_id`, acima.
++
++---
++
++## 4. Achados de severidade média
++
++### F8 — `get_fi_id_from_dn()` confunde fabric por substring **[PoC]**
++
++```python
++def get_fi_id_from_dn(dn):          # :681
++    if 'A' in dn: return 'A'
++    elif 'B' in dn: return 'B'
++```
++
++Busca de substring em todo o DN, com `A` tendo precedência incondicional sobre `B`:
++
++```
++sys/switch-B/slot-1/switch-ether/port-1   -> B   ✓
++fabric/lan/B/net-VLAN_A                   -> A   ✗  (é fabric B)
++```
++
++Qualquer DN que carregue rótulo definido pelo usuário contendo `A` maiúsculo é atribuído ao fabric errado. **Correção:** extrair o token de fabric por posição no DN ou por regex ancorada (`switch-([AB])/`).
++
++### F9 — `isFloat()` valida com `float()` mas converte com `int()` **[PoC]**
++
++```python
++def get_speed_num_from_string(speed, item):    # :696
++    if isFloat(speed):
++        return (int)(speed)                     # ValueError para '10.5', 'nan', 'inf'
++    ...
++    return (int)(((str)(speed)).rstrip('gbps'))
++```
++
++```
++'10.5' -> CRASH ValueError: invalid literal for int() with base 10: '10.5'
++'nan'  -> CRASH
++'inf'  -> CRASH
++```
++
++Por F4, essa exceção mata o ciclo. Segundo defeito na mesma função: `rstrip('gbps')` remove **caracteres do conjunto** `{g,b,p,s}`, não o sufixo — funciona por acaso para os valores atuais (`'10gbps'→'10'`), mas `'sgbps'` vira `''`. O correto é `removesuffix('gbps')`.
++
++### F10 — Filtro de estado por substring: `'associated' in 'unassociated'` **[PoC]**
++
++Nove ocorrências do padrão. A mais relevante, em `:2645` e `:2733`:
++
++```python
++if 'ok' not in per_blade_dict['oper_state'] or \
++   'associated' not in per_blade_dict['association']:
++    continue
++```
++
++`'associated' in 'unassociated'` é `True` — um blade **não associado** passa no teste de associação. Hoje isso está **mascarado** pela condição combinada: um blade não associado costuma ter `oper_state='unassociated'`, que falha no teste `'ok' not in ...`. Mas a proteção é acidental, não projetada: um blade com `oper_state='ok'` e `association='unassociated'` (estado possível durante/após desassociação, com o blade energizado e descoberto) passa pelo filtro e é emitido com o service profile residual.
++
++**Correção:** comparação por igualdade contra `StrEnum`, nunca por substring.
++
++### F11 — `cleanup_ucs_connections()` quebra com `--no-ssh` **[código]**
++
++```python
++for domain_ip, handles in conn_dict.items():    # :607
++    cli_handle = handles['cli']                  # KeyError
++    sdk_handle = handles['sdk']
++    cli_handle.disconnect()                      # AttributeError se None
++    sdk_handle.logout()
++```
++
++Em `connect_and_pull_stats()` (`:474`), o ramo `cli` faz `return` por causa de `--no-ssh` **antes** de atribuir `conn_dict[domain_ip]['cli']`. Com `--no-ssh` + `-dss`, a chave nunca existe → `KeyError`. E sem `None`-check, uma falha de login vira `AttributeError` — exatamente no caminho de limpeza, isto é, na hora em que já há um problema.
++
++### F12 — A flag `-ct` não controla o que promete **[código]**
++
++`-ct/--connection-timeout` é documentada como *"Total timeout in seconds for login/auth and metrics pull (Default:45s)"*, mas:
++
++- é passada **apenas** ao netmiko: `ConnectHandler(..., timeout=user_args.get('conn_timeout'))` (`:418`)
++- o login do SDK usa a constante `CONNECTION_TIMEOUT = 10`, hardcoded (`:435`)
++- **`query_classids()` não tem timeout nenhum** (`:548`)
++
++O *stats pull* do SDK — a operação mais cara do ciclo — não tem limite de tempo. O único limite efetivo é o `SIGKILL` do Telegraf aos 50 s, que é justamente o caminho que deixa sessões órfãs (F4). `MASTER_TIMEOUT = 48` (`:27`) só é usado para **logar um aviso depois do fato**, nunca para interromper nada.
++
++---
++
++## 5. Hipóteses a validar em campo (não confirmadas)
++
++Explicitamente separadas dos achados acima — **não tratar como fato**:
++
++- **H1:** as stat collection policies reais dos domínios divergem do `polling_interval` dos dashboards (F6 seria não apenas possível, mas ativo). Validar: `show stats-collection-policy detail` em cada domínio, comparar com `telegraf.conf` e com a variável do Grafana.
++- **H2:** existem sessões órfãs acumuladas no UCSM hoje. Validar: `show system-session` / `scope security; show user-sessions detail`.
++- **H3:** os `.pickle` em produção contêm credenciais (F1 prova que é assim por construção; falta confirmar na VM). Validar com o `strings` da seção F1.
++- **H4:** a cardinalidade de séries por vNIC é alta o bastante para pesar no dimensionamento da TSDB. Validar: `SHOW SERIES CARDINALITY` no InfluxDB.
++
++---
++
++## 6. Stack de infraestrutura **[código]**
++
++De `ansible-install/utm.yml`:
++
++| Componente | Estado | Consequência |
++|---|---|---|
++| CentOS 7 | EOL desde 2024-06-30 | sem patches de segurança |
++| Python 3.6 (base do CentOS 7) | EOL desde 2021-12 | força `pip==21.3.1` e `netmiko==4.0.0` |
++| InfluxDB 1.x | linha em manutenção mínima | InfluxQL; upgrade não trivial |
++| Grafana `10.1.10-1` | **fixado** | ver abaixo |
++
++O pin do Grafana é o sintoma mais eloquente. O próprio playbook documenta o motivo:
++
++```yaml
++# 10.1.10-1 : OK
++# 10.2.0-1  : Service Profile "None"
++# 10.2.8-1  : UCS Traffic Monitoring - error parsing query: found [, expected identifier...
++```
++
++A causa raiz não é o Grafana: são **2,9 MB de JSON de dashboard editados pela UI** (o maior, `service_profile.json`, tem 842 KB), que não são revisáveis nem diffáveis. Sem dashboards como código, todo upgrade de Grafana vira teste de regressão manual de 9 dashboards — então ninguém atualiza.
++
++Volume de log: `LOGFILE_SIZE = 20 MB × LOGFILE_NUMBER = 10`, por arquivo de entrada. Com os dois grupos do exemplo e o `-vv` (INFO) que o README recomenda, são até **400 MB de log rotativo** gerados a cada 60 s de operação.
++
++---
++
++# PARTE II — ARQUITETURA-ALVO
++
++## 7. Princípio estrutural
++
++Os sete achados críticos/altos têm três causas raiz, e cada uma tem uma fronteira arquitetural correspondente:
++
++| Causa raiz | Achados | Fronteira que a elimina |
++|---|---|---|
++| Processo efêmero obriga persistir sessão em disco | F1, F2 | serviço long-running: sessão vive em memória |
++| Serialização manual por concatenação de string | F3, F6 | `exporters/` é a **única** camada que conhece formato de saída |
++| Estado global mutável sem isolamento de falha | F4, F5, F7 | `transform/` são funções puras sobre modelos imutáveis |
++
++A regra é uma só: **`collectors/` faz I/O e nada mais; `transform/` não faz I/O e nada mais; `exporters/` serializa e nada mais.** Todo o valor intelectual do projeto — o stitching — passa a ser função pura sobre estruturas tipadas, testável com fixtures gravadas, sem UCSM.
++
++```
++┌──────────────────────────────────────────────────────────────────┐
++│  utm-collector  (serviço asyncio long-running)                   │
++│                                                                  │
++│  runtime/scheduler.py   1 TaskGroup por domínio — falha contida  │
++│  runtime/session.py     pool em memória, refresh, circuit breaker│
++│                              ▼                                   │
++│  collectors/            I/O puro → RawSnapshot (imutável)        │
++│    ├─ ucsm_sdk.py       query_classids em executor dedicado      │
++│    ├─ ucsm_cli.py       scrapli + asyncssh                       │
++│    └─ intersight.py     [Fase 6, condicionado a validação]       │
++│                              ▼                                   │
++│  transform/             FUNÇÕES PURAS — 100 % testáveis          │
++│    ├─ normalize.py      RawSnapshot → DomainSnapshot tipado      │
++│    ├─ topology.py       stitching vNIC → VIF → backplane→uplink  │
++│    └─ rates.py          delta UCSM + timeCollected → bits/s  (F6)│
++│                              ▼                                   │
++│  exporters/             ÚNICO lugar que serializa           (F3) │
++│    ├─ prometheus.py     /metrics                                 │
++│    ├─ influx_lp.py      Line Protocol com escape correto         │
++│    └─ otlp.py                                                    │
++│                                                                  │
++│  observability/selfmetrics.py   saúde da coleta             (F4) │
++└──────────────────────────────────────────────────────────────────┘
++```
++
++### 7.1 Modelo de domínio
++
++```python
++# src/utm/domain/models.py
++from __future__ import annotations
++
++from datetime import datetime, timedelta
++from enum import StrEnum
++from ipaddress import IPv4Address
++from typing import Annotated, Self
++
++from pydantic import BaseModel, ConfigDict, Field, model_validator
++
++
++class FabricId(StrEnum):
++    A = "A"
++    B = "B"
++
++
++class Association(StrEnum):
++    """Comparação por igualdade — nunca por substring (F10)."""
++
++    ASSOCIATED = "associated"
++    UNASSOCIATED = "unassociated"
++    ASSOCIATING = "associating"
++    REMOVING = "removing"
++    FAILED = "failed"
++
++
++class Frozen(BaseModel):
++    model_config = ConfigDict(frozen=True, extra="forbid")
++
++
++class DeltaSample(Frozen):
++    """Delta calculado PELO UCSM, com o intervalo sobre o qual ele vale.
++
++    `interval` é o que resolve F6: sem ele não há como converter o delta
++    em taxa sem assumir que a stat collection policy do UCSM coincide com
++    o intervalo de scrape — que é exatamente a suposição não validada de hoje.
++    """
++
++    delta: Annotated[int, Field(ge=0)]
++    interval: timedelta          # de `intervals` / `timeCollected` do MO
++    collected_at: datetime
++
++    @property
++    def per_second(self) -> float:
++        seconds = self.interval.total_seconds()
++        return self.delta / seconds if seconds > 0 else 0.0
++
++
++class FiPort(Frozen):
++    dn: str
++    fabric: FabricId             # extraído por regex ancorada, não substring (F8)
++    slot: int
++    port: int
++    aggr_port: int | None = None
++    description: str = ""        # texto livre do UCSM — escape é do exporter (F3)
++    admin_up: bool
++    oper_up: bool
++    speed_mbps: int | None = None
++    peer_dn: str | None = None
++
++    rx: DeltaSample | None = None
++    tx: DeltaSample | None = None
++    rx_pause: DeltaSample | None = None
++    tx_pause: DeltaSample | None = None
++
++
++class DomainSnapshot(Frozen):
++    """Estado de um domínio em um instante. Unidade de troca entre camadas."""
++
++    domain_ip: IPv4Address
++    location: str
++    ucsm_version: str
++    collected_at: datetime
++    collection_duration: timedelta
++
++    ports: tuple[FiPort, ...] = ()
++    blades: tuple[Blade, ...] = ()
++
++    partial: bool = False
++    errors: tuple[str, ...] = ()
++
++    @model_validator(mode="after")
++    def _partial_requires_reason(self) -> Self:
++        if self.partial and not self.errors:
++            raise ValueError("snapshot parcial exige ao menos um erro registrado")
++        return self
++```
++
++`partial` + `errors` é a resposta direta a F4: um snapshot degradado é **explicitamente** degradado. O exporter emite `utm_collection_partial{domain=...} 1` em vez de simplesmente omitir séries — e "coleta falhou" deixa de ser indistinguível de "sem tráfego".
++
++### 7.2 Serialização — a correção de F3
++
++Nenhum `+` monta Line Protocol. Um único ponto escapa, e é coberto por teste de propriedade:
++
++```python
++# src/utm/exporters/influx_lp.py
++_TAG_ESCAPES = str.maketrans({",": r"\,", "=": r"\=", " ": r"\ "})
++_STR_FIELD_ESCAPES = str.maketrans({'"': r"\"", "\\": r"\\"})
++
++
++def escape_tag(value: str) -> str:
++    """Tag key, tag value e measurement: escapar vírgula, igual e espaço."""
++    return value.translate(_TAG_ESCAPES)
++
++
++def escape_string_field(value: str) -> str:
++    """Field string: escapar aspas e barra. Newline vira espaço — nunca
++    pode chegar ao stream, que é delimitado por newline (F3)."""
++    return value.replace("\n", " ").replace("\r", " ").translate(_STR_FIELD_ESCAPES)
++```
++
++```python
++# tests/exporters/test_influx_lp.py
++from hypothesis import given, strategies as st
++
++@given(descr=st.text(min_size=0, max_size=200))
++def test_arbitrary_port_description_never_breaks_the_line(descr: str) -> None:
++    """F3: nenhuma descrição de porta pode gerar mais de uma linha."""
++    port = make_port(description=descr)
++    rendered = influx_lp.render_fi_port(port, domain="10.1.1.1", location="DC 1")
++    assert rendered.count("\n") == 1, f"injeção de linha com descr={descr!r}"
++```
++
++### 7.3 Taxas normalizadas — a correção de F6
++
++```python
++# src/utm/transform/rates.py
++from dataclasses import dataclass
++
++from utm.domain.models import DeltaSample
++
++
++@dataclass(frozen=True, slots=True)
++class Rate:
++    bits_per_second: float
++    interval_s: float
++    stale: bool
++
++
++def to_rate(sample: DeltaSample | None, scrape_interval_s: float) -> Rate | None:
++    """Converte o delta do UCSM em taxa usando o intervalo REAL do UCSM.
++
++    Elimina a dependência entre stat collection policy, intervalo do Telegraf
++    e a variável [[polling_interval]] do dashboard (F6).
++    """
++    if sample is None:
++        return None
++
++    interval_s = sample.interval.total_seconds()
++    if interval_s <= 0:
++        return None
++
++    # A policy do UCSM é mais lenta que o scrape: o mesmo delta será relido.
++    # Marcar como stale em vez de contar duas vezes.
++    stale = interval_s > scrape_interval_s * 1.5
++
++    return Rate(
++        bits_per_second=(sample.delta * 8) / interval_s,
++        interval_s=interval_s,
++        stale=stale,
++    )
++```
++
++Com isso o dashboard deixa de fazer aritmética: consome `bits_per_second` direto. E `utm_stat_policy_interval_seconds{domain,stat_type}` vira métrica exportada — a divergência de H1 passa a ser **observável e alertável** em vez de silenciosa.
++
++### 7.4 Meta-métricas — a correção de F4
++
++Sempre emitidas, principalmente quando a coleta falha:
++
++```
++utm_collection_success{domain,collector}           0|1
++utm_collection_duration_seconds{domain,collector}  histogram
++utm_collection_partial{domain}                     0|1
++utm_collection_last_success_timestamp{domain}      gauge (unix)
++utm_ucsm_sessions_open{domain}                     gauge   ← detecta F4/H2
++utm_session_reconnects_total{domain,kind}          counter
++utm_circuit_breaker_state{domain}                  0=closed 1=half 2=open
++utm_stat_policy_interval_seconds{domain,stat_type} gauge   ← detecta F6/H1
++utm_export_lines_rejected_total{exporter,reason}   counter ← detecta F3
++```
++
++```promql
++# Domínio sem coleta bem-sucedida há mais de 5 minutos
++time() - utm_collection_last_success_timestamp > 300
++
++# Sessões UCSM acumulando (limite padrão: 32 por usuário)
++utm_ucsm_sessions_open > 20
++
++# Policy do UCSM divergindo do intervalo de scrape
++utm_stat_policy_interval_seconds != on(domain) group_left utm_scrape_interval_seconds
++```
++
++---
++
++## 8. Decisões técnicas
++
++### ADR-01 — Serviço long-running em vez de `inputs.exec`
++
++| Opção | Prós | Contras |
++|---|---|---|
++| Manter `exec` | zero mudança operacional | obriga o `pickle` (F1/F2), sem estado, timeout rígido, sem isolamento (F4) |
++| **Serviço + `/metrics`** | sessão em memória, isolamento por domínio, meta-métricas | nova unit/container para operar |
++| Telegraf `execd` | mantém Telegraf no caminho | processo persistente sem ganho arquitetural sobre a opção 2 |
++
++**Decisão: serviço long-running.** Fecha F1, F2 e F4 de uma vez — sem processo efêmero, não existe motivo para serializar sessão em disco. O Telegraf continua disponível como scraper Prometheus (`inputs.prometheus` → `outputs.influxdb`) durante a migração, o que torna o corte reversível.
++
++### ADR-02 — TSDB
++
++| Opção | Ingest | Query | Esforço em dashboards |
++|---|---|---|---|
++| InfluxDB 1.8 (hoje) | LP | InfluxQL | zero |
++| InfluxDB 3 | LP + SQL | SQL/InfluxQL | alto |
++| Prometheus | scrape/remote-write | PromQL | alto; sem histórico migrado |
++| **VictoriaMetrics** | **LP + Prometheus + OTLP** | MetricsQL | alto, mas faseável |
++
++**Decisão: VictoriaMetrics** — o ponto decisivo é aceitar **Line Protocol** no endpoint `/write`: dá para apontar o Telegraf atual para ele e rodar os dois bancos em paralelo, sem tocar no coletor, validando dado contra dado antes de qualquer corte.
++
++**Contrapeso honesto:** as 9 dashboards estão em InfluxQL; a reescrita para MetricsQL é a parte cara desta decisão e só compensa junto com o ADR-07. **Se a equipe não topar isso agora, a alternativa defensável é permanecer em InfluxDB 1.8 e trocar só o coletor** — os ADRs 01, 03, 04, 05, 06 e 08 continuam valendo isoladamente, e F1–F7 são todos fechados sem trocar de TSDB. A troca de banco é a única decisão deste RFC que pode ser adiada sem custo de correção.
++
++### ADR-03 — `asyncio` com isolamento por domínio
++
++O padrão atual (`ThreadPoolExecutor(max_workers=len(executor_list))`, `:586`) escala threads linearmente com domínios × tipos de conexão e não isola falhas.
++
++**Decisão: `asyncio`**, um `TaskGroup` por domínio, `asyncio.timeout()` por operação. Substitui o `MASTER_TIMEOUT` global (que só loga depois do fato — F12) por timeout real e **por domínio**: um domínio lento deixa de atrasar os demais, e uma exceção deixa de derrubar o ciclo inteiro (F4). O `ucsmsdk`, que é síncrono, roda em executor dedicado.
++
++### ADR-04 — Manter `ucsmsdk`, atrás de um Protocol
++
++**Decisão: manter no curto prazo, abstraído atrás do `Collector` Protocol.** Com o contrato isolado, trocar por `httpx` + XML API direta depois é troca de um arquivo, não reescrita. Medir primeiro (`utm_collection_duration_seconds` por collector), decidir depois.
++
++**Intersight:** domínios em *Intersight Managed Mode* (6400/6500) não falam a XML API do UCSM. A arquitetura reserva `collectors/intersight.py`. **Não comprometer roadmap antes de validar** granularidade de telemetria, limites de rate e se existe equivalente ao `DcxVc` para o stitching de VIF.
++
++### ADR-05 — scrapli/asyncssh no lugar do netmiko
++
++netmiko é síncrono e está pinado em `4.0.0` por causa do Python 3.6. scrapli + `asyncssh` é nativamente assíncrono, tem driver `cisco_nxos` e oferece `textfsm_parse_output()` — que substitui o parsing manual de `parse_pfc_stats()` e elimina a classe de erro de F7. Pré-requisito: Python ≥ 3.10 (ADR-06).
++
++### ADR-06 — Runtime e empacotamento
++
++**Decisão:** Python 3.12, `uv` para resolução/lock, container OCI como artefato primário, unit systemd com `EnvironmentFile` como alternativa. O container resolve a causa real por trás do CentOS 7: o SO da VM deixa de ditar a versão de Python.
++
++### ADR-07 — Dashboards como código
++
++2,9 MB de JSON editados na UI são a causa do pin do Grafana.
++
++**Decisão: Grafana Foundation SDK (Python)**, gerando JSON em build, provisionado por arquivo. Permite fatorar os painéis repetidos em funções parametrizadas — o mesmo painel de utilização aparece dezenas de vezes com variações de tag. Grafonnet é a alternativa madura, mas acrescenta Jsonnet como segunda linguagem.
++
++### ADR-08 — Testes com fixtures gravadas
++
++**Decisão:** comando `utm record --domain <ip> --output tests/fixtures/` captura a resposta real do UCSM, anonimiza (IP, serial, WWPN, service profile, descrição) e grava. A partir daí todo `transform/` e `exporters/` é testado offline:
++
++```python
++# tests/transform/test_topology.py
++@pytest.mark.parametrize("fixture", ["ucsm_4.2_8chassis", "ucsm_4.3_mixed_rack", "ucsm_4.3_fex_only"])
++def test_every_active_vif_resolves_to_an_uplink(fixture, load_fixture):
++    snapshot = normalize.from_raw(load_fixture(fixture))
++    stitched = topology.stitch(snapshot)
++    unresolved = [v for b in stitched.blades for v in b.vifs if v.uplink_port_dn is None]
++    assert not unresolved, f"VIFs sem uplink: {[v.dn for v in unresolved]}"
++
++
++def test_fex_peer_without_rack_units_does_not_raise(load_fixture):
++    """Regressão de F5: domínio só com blades + FEX com peer rack."""
++    snapshot = normalize.from_raw(load_fixture("ucsm_4.3_fex_only"))
++    lines = influx_lp.render(topology.stitch(snapshot))
++    assert lines  # antes: UnboundLocalError → ciclo inteiro perdido
++```
++
++Alvo: **≥ 80 % em `transform/` e `exporters/`**. Smoke test em `collectors/` com servidor fake. Nenhuma meta de cobertura para `runtime/`.
++
++### ADR-09 — Credenciais
++
++**Decisão: adotar `docs/superpowers/specs/2026-04-25-utm-credentials-design.md` como está**, com **um adendo obrigatório**: a remoção do `pickle` é pré-requisito, não item opcional. F1 prova que sem ela a senha continua sendo escrita em disco a cada ciclo e o ganho da migração para env vars é parcial.
++
++---
++
++# PARTE III — EXECUÇÃO
++
++## 9. Correções pontuais — antes de qualquer refatoração
++
++Cinco itens de baixo risco, alto retorno, independentes do RFC:
++
++1. **F5 — uma palavra.** `:2793`: trocar `per_ru_dict` por `ru_dict`. Elimina a perda total de ciclo em domínios só com blades + FEX.
++2. **F1/F2 — contenção imediata.** `chmod 600` nos `.pickle`, dono restrito ao usuário do Telegraf, e `shred` nos existentes. Confirmar H3 antes com o `strings` da seção F1.
++3. **F11 — `None`-check e `.get()`** em `cleanup_ucs_connections()` (`:607-614`). Quatro linhas.
++4. **F6/H1 — auditoria.** `show stats-collection-policy detail` em todos os domínios; comparar com o `interval` do Telegraf e com `[[polling_interval]]`. Se divergirem, **os números de banda dos dashboards estão errados hoje** — alinhar imediatamente.
++5. **F4 — uma métrica de saúde.** Emitir `UTMCollectorHealth,domain=<ip> success=0|1` ao final de cada ciclo, inclusive em falha. ~10 linhas, e transforma o Grafana de "acho que está coletando" em "sei que está".
++
++## 10. Plano de migração — *strangler pattern*
++
++O coletor atual permanece em produção até a paridade estar provada.
++
++### Fase 0 — Rede de segurança (1 semana)
++- [ ] `pyproject.toml`, `ruff`, `mypy`, `pytest`, GitHub Actions
++- [ ] `utm record` — captura e anonimização de fixtures reais
++- [ ] **Harness de paridade:** roda o script antigo e o novo sobre a mesma fixture e faz diff do Line Protocol normalizado. **Critério de aceite bloqueante de todas as fases seguintes.**
++- [ ] Aplicar as 5 correções pontuais da seção 9, cada uma com teste de regressão
++
++**Saída:** F5, F11 fechados; F1/F2 contidos; F6 diagnosticado. Nenhuma mudança arquitetural.
++
++### Fase 1 — Credenciais + remoção do `pickle` (2 semanas)
++- [ ] `credentials.py` conforme a spec aprovada
++- [ ] Remover `pickle` — aceitar o custo de login por ciclo **temporariamente** (ainda sob `exec`)
++- [ ] `shred` nos `.pickle` existentes; `utm migrate-credentials` converte os `.txt`
++
++**Saída:** F1, F2 fechados. Ciclo fica mais lento até a Fase 3 — monitorar com a métrica do item 5 da seção 9.
++
++### Fase 2 — Núcleo tipado (4 semanas)
++- [ ] `domain/models.py`, `transform/{normalize,topology,rates}.py`
++- [ ] `exporters/influx_lp.py` **com escape correto** + teste de propriedade (F3)
++- [ ] Portar o stitching das 5 funções gigantes, **função por função, com o harness verde a cada passo**
++- [ ] Cobertura ≥ 80 % em `transform/`
++
++**Saída:** F3, F6, F7, F8, F9, F10 fechados. Maior risco e maior retorno da migração.
++
++### Fase 3 — Runtime como serviço (3 semanas)
++- [ ] `runtime/{scheduler,session,health}.py`, `collectors/` com scrapli
++- [ ] `exporters/prometheus.py` + meta-métricas
++- [ ] Container + unit systemd
++- [ ] Rodar em paralelo ao coletor antigo, no mesmo InfluxDB, com prefixo de medição distinto
++
++**Saída:** F4, F12 fechados. Validar paridade em produção por 2 semanas antes de seguir.
++
++### Fase 4 — Armazenamento (2 semanas) — *opcional, ver ADR-02*
++- [ ] VictoriaMetrics recebendo LP em paralelo; comparar séries por 1 semana
++- [ ] Retenção e downsampling; corte e desligamento do coletor antigo
++
++### Fase 5 — Dashboards como código (2 semanas)
++- [ ] Extrair os 9 JSONs para Foundation SDK, fatorar painéis repetidos
++- [ ] Remover a aritmética de taxa das queries (já resolvida em `rates.py`)
++- [ ] Provisionamento em arquivo; **destravar o pin do Grafana**
++
++### Fase 6 — Intersight — *bloqueada*
++- [ ] Validar viabilidade de telemetria na API (pré-requisito absoluto)
++- [ ] `collectors/intersight.py`; modelo unificado UCSM + IMM
++
++## 11. Esforço e riscos
++
++| Fase | Esforço | Risco | Mitigação |
++|---|---|---|---|
++| 0 — Rede de segurança | 1 sem | Baixo | sem mudança arquitetural |
++| 1 — Credenciais | 2 sem | Médio | rollback documentado; ciclo temporariamente mais lento |
++| 2 — Núcleo tipado | 4 sem | **Alto** | harness de paridade bloqueante a cada passo |
++| 3 — Runtime | 3 sem | Médio | operação em paralelo ao antigo |
++| 4 — TSDB | 2 sem | Médio | dual-write + 1 semana de comparação; **adiável** |
++| 5 — Dashboards | 2 sem | Médio | dashboards antigos preservados até validação |
++| 6 — Intersight | ? | Alto | bloqueada até validação da API |
++| **Total (0–5)** | **~14 sem** | | |
++
++**Riscos principais:**
++
++- **Regressão silenciosa no stitching (Fase 2).** É a lógica mais complexa e menos documentada do projeto. Mitigação: harness de paridade com fixtures de múltiplas versões de UCSM e topologias distintas (blade, rack, FEX, misto, UCS Mini).
++- **Correção de F6 muda os números dos dashboards.** Se H1 se confirmar, os valores de banda **vão mudar** após a correção — e estarão certos pela primeira vez. Comunicar antes, não depois; guardar a série antiga para comparação.
++- **Reescrita das dashboards (Fase 5).** Maior bloco de trabalho manual. Mitigação: fatorar antes de portar.
++
++## 12. O que explicitamente NÃO muda
++
++- O stitching end-to-end vNIC → uplink é preservado integralmente. A refatoração o torna testável, não diferente.
++- Nomes de measurement, tags e unidades — exceto onde F6 exige (taxa passa de delta bruto para bits/s, mudança anunciada e versionada). Caso contrário o histórico do InfluxDB fica órfão.
++- Compatibilidade com UCSM clássico. Intersight é adição, nunca substituição.
++
++## 13. Decisões pendentes
++
++1. **Trocar de TSDB agora ou depois?** ADR-02 deixa claro que é a única decisão adiável sem custo de correção. Recomendação: Fases 0–3 primeiro, decidir com dados de cardinalidade reais (H4) em mãos.
++2. **Container ou systemd puro?** Depende da política da VM de produção.
++3. **Upstream ou fork?** Fases 0–2 são candidatas naturais a PR upstream — F1, F3, F5, F6 e F7 afetam **todos** os usuários do projeto. Fases 3–5 mudam o modelo de deploy e provavelmente vivem só no fork.
++4. **Divulgação dos achados de segurança.** F1, F2 e F3 afetam qualquer instalação do UTM. Decidir se a comunicação ao mantenedor é privada primeiro.
+diff --git a/docs/refactor/README.md b/docs/refactor/README.md
+new file mode 100644
+index 0000000..7deb599
+--- /dev/null
++++ b/docs/refactor/README.md
+@@ -0,0 +1,40 @@
++# Refatoração do UTM — documentos
++
++| Documento | Conteúdo |
++|---|---|
++| [`2026-09-20-utm-modernization-rfc.md`](2026-09-20-utm-modernization-rfc.md) | Análise técnica verificada, arquitetura-alvo e plano de migração |
++| [`poc/verify_findings.py`](poc/verify_findings.py) | Reprodução executável dos achados |
++
++## Reproduzir os achados
++
++```sh
++python3 -m pip install ucsmsdk          # opcional; sem ele, F1 é pulado
++python3 docs/refactor/poc/verify_findings.py
++python3 docs/refactor/poc/verify_findings.py --finding F3
++```
++
++Sai com 0 se todos os defeitos forem reproduzidos. Não acessa nenhum UCS —
++cada verificação extrai o trecho real de `telegraf/ucs_traffic_monitor.py`,
++com a referência de linha no docstring.
++
++## Achados
++
++| # | Achado | Sev. | Correção proposta |
++|---|---|---|---|
++| F1 | Senha do UCS em texto claro no `.pickle` | Crítica | Fase 1 — remover o `pickle` |
++| F2 | `pickle.load()` de arquivo gravável = RCE | Crítica | Fase 1 — remover o `pickle` |
++| F3 | Injeção de Line Protocol via descrição de porta | Crítica | Fase 2 — escape no exporter |
++| F4 | Uma exceção descarta o ciclo de todos os domínios | Alta | Fase 3 — isolamento por domínio |
++| F5 | `UnboundLocalError` em `print_output_in_influxdb_lp()` | Alta | **correção pontual** (`:2793`) |
++| F6 | Taxa de banda depende de 3 configs não sincronizadas | Alta | Fase 2 — `transform/rates.py` |
++| F7 | `iom_slot_id` vaza → PAUSE no IOM errado | Alta | Fase 2 — função pura |
++| F8 | `get_fi_id_from_dn()` erra fabric por substring | Média | Fase 2 — regex ancorada |
++| F9 | `isFloat()` valida com `float()`, converte com `int()` | Média | Fase 2 |
++| F10 | `'associated' in 'unassociated'` | Média | Fase 2 — `StrEnum` |
++| F11 | `cleanup_ucs_connections()` quebra com `--no-ssh` | Média | **correção pontual** (`:607`) |
++| F12 | `-ct` não controla o timeout do stats pull do SDK | Média | Fase 3 |
++
++Hipóteses ainda **não** confirmadas (H1–H4) estão na seção 5 do RFC, separadas
++dos fatos. H1 (divergência entre stat collection policy e `polling_interval`)
++é a mais urgente: se confirmada, os números de banda dos dashboards estão
++errados hoje.
+diff --git a/docs/refactor/poc/verify_findings.py b/docs/refactor/poc/verify_findings.py
+new file mode 100644
+index 0000000..94a7953
+--- /dev/null
++++ b/docs/refactor/poc/verify_findings.py
+@@ -0,0 +1,329 @@
++#!/usr/bin/env python3
++"""Reprodução executável dos achados do RFC 2026-09-20.
++
++Cada verificação extrai o código real de `telegraf/ucs_traffic_monitor.py`
++(referência de linha no docstring) e demonstra o defeito. Nenhum acesso a
++UCS é necessário — os achados são determinísticos.
++
++Uso:
++    python3 docs/refactor/poc/verify_findings.py
++    python3 docs/refactor/poc/verify_findings.py --finding F3
++
++F1 exige o ucsmsdk instalado; é pulado automaticamente se ausente.
++Saída: 0 se todos os defeitos foram reproduzidos, 1 caso contrário.
++"""
++
++from __future__ import annotations
++
++import argparse
++import re
++import sys
++from dataclasses import dataclass, field
++from typing import Callable
++
++
++@dataclass
++class Result:
++    finding: str
++    title: str
++    reproduced: bool
++    notes: list[str] = field(default_factory=list)
++    skipped: bool = False
++
++
++# --------------------------------------------------------------------------
++# F1 — o pickle do UcsHandle carrega a senha em texto claro  (:631)
++# --------------------------------------------------------------------------
++def check_f1() -> Result:
++    r = Result("F1", "Senha do UCS em texto claro no arquivo .pickle", False)
++    try:
++        import pickle
++
++        from ucsmsdk.ucshandle import UcsHandle
++    except ImportError:
++        r.skipped = True
++        r.notes.append("ucsmsdk não instalado — pulado (pip install ucsmsdk)")
++        return r
++
++    secret = "SuperSecret123!"  # noqa: S105 - valor sintético de teste
++    blob = pickle.dumps(UcsHandle("10.1.1.1", "svc_utm_ro", secret))
++
++    r.reproduced = secret.encode() in blob
++    printable = [s for s in re.findall(rb"[ -~]{8,}", blob) if b"svc_utm" in s or b"Secret" in s]
++    r.notes.append(f"tamanho do pickle: {len(blob)} bytes")
++    r.notes.append(f"strings recuperáveis: {printable}")
++    return r
++
++
++# --------------------------------------------------------------------------
++# F3 — injeção de Line Protocol pela descrição da porta  (:2563)
++# --------------------------------------------------------------------------
++def _build_fi_port_line(description: str) -> str:
++    """Cópia literal da construção de linha de print_output_in_influxdb_lp()."""
++    prefix = "FIUplinkPortStats,domain=" + "10.1.1.1"
++    tags = "," + "fi_id=A,location=DC1,port=1/17,transport=ether"
++    fields = (
++        " "
++        + 'admin_state="' + "enabled" + '",'
++        + 'description="' + description + '",'      # <- sem escape
++        + "oper_speed=" + str(10) + ","
++        + 'oper_state="' + "up" + '"'
++    )
++    return prefix + tags + fields + "\n"
++
++
++def check_f3() -> Result:
++    r = Result("F3", "Injeção de Line Protocol via descrição de porta do UCSM", False)
++
++    ok = _build_fi_port_line("Uplink para Nexus 93180 Po10")
++    r.notes.append(f"descrição normal  -> {ok.count(chr(10))} linha(s) (esperado 1)")
++
++    quoted = _build_fi_port_line('link "backup"')
++    broken = quoted.count('"') % 2 != 0 or 'description="link "backup""' in quoted
++    r.notes.append(f"descrição com aspas -> linha malformada: {broken}")
++
++    payload = 'x",fake=1\nFIUplinkPortStats,domain=10.1.1.1,port=99/99 bytes_rx_delta=999999999i\nz="'
++    injected = _build_fi_port_line(payload)
++    n_lines = len(injected.strip().splitlines())
++    r.notes.append(f"payload de injeção -> {n_lines} linhas geradas (esperado 1)")
++    if n_lines > 1:
++        r.notes.append(f"  linha forjada: {injected.strip().splitlines()[1]}")
++
++    r.reproduced = broken and n_lines > 1
++    return r
++
++
++# --------------------------------------------------------------------------
++# F5 — variável de loop vazada em print_output_in_influxdb_lp()  (:2793)
++# --------------------------------------------------------------------------
++def check_f5() -> Result:
++    r = Result("F5", "UnboundLocalError no caminho de FEX com peer rack-unit", False)
++
++    def render(d_dict: dict, bp_peer: str) -> str:
++        """Estrutura de controle idêntica a :2711 e :2791-2797."""
++        out = ""
++        ru_dict = d_dict["ru"]
++        for ru_id, per_ru_dict in ru_dict.items():           # :2711 — único bind
++            out += ru_id + per_ru_dict["service_profile"]
++
++        # :2791-2797 — trecho do loop de FEX
++        ru_dict = d_dict["ru"]
++        ru_server = bp_peer
++        if ru_server in per_ru_dict:                          # BUG: deveria ser ru_dict
++            per_ru_dict = ru_dict[ru_server]
++            out += ",peer_service_profile=" + per_ru_dict["service_profile"]
++        return out
++
++    # Caso 1: domínio só com blades (ru vazio) -> per_ru_dict nunca vinculado
++    try:
++        render({"ru": {}}, bp_peer="rack-unit-5")
++        r.notes.append("domínio sem rack units -> NÃO levantou exceção (inesperado)")
++    except (UnboundLocalError, NameError) as exc:
++        r.reproduced = True
++        r.notes.append(f"domínio sem rack units -> {type(exc).__name__}: {exc}")
++        r.notes.append("  por F4, isso descarta o ciclo inteiro de TODOS os domínios")
++
++    # Caso 2: com rack units -> tag silenciosamente omitida
++    d = {"ru": {"rack-unit-5": {"service_profile": "SP-ESX-05"}}}
++    rendered = render(d, bp_peer="rack-unit-5")
++    omitted = "peer_service_profile" not in rendered
++    r.notes.append(f"com rack units -> tag peer_service_profile omitida: {omitted}")
++    return r
++
++
++# --------------------------------------------------------------------------
++# F7 — iom_slot_id vaza entre linhas do parser de PFC  (:2162, :2211, :2281)
++# --------------------------------------------------------------------------
++def check_f7() -> Result:
++    r = Result("F7", "iom_slot_id vaza entre iterações -> PAUSE no IOM errado", False)
++
++    def resolve(bp_port_dict: dict, fi_id: str, iom_slot_id):
++        """Bloco de :2211 / :2281 — só atribui quando há correspondência."""
++        for iom_slot, port_dict in bp_port_dict.items():
++            for _iom_port, per_bp in port_dict.items():
++                if per_bp["fi_id"] == fi_id:
++                    iom_slot_id = iom_slot
++                break
++        return iom_slot_id
++
++    # Linha 1: casa com fabric A -> slot "1"
++    bp_a = {"1": {"09": {"fi_id": "A"}}}
++    slot = resolve(bp_a, "A", 0)
++    r.notes.append(f"linha 1 (casa fabric A) -> iom_slot_id={slot!r}")
++
++    # Linha 2: chassi só com IOM do fabric B, coletando fabric A -> não casa
++    bp_b = {"2": {"09": {"fi_id": "B"}}}
++    leaked = resolve(bp_b, "A", slot)   # iom_slot_id carrega o valor da linha 1
++    r.notes.append(f"linha 2 (não casa)     -> iom_slot_id={leaked!r} (vazou da linha 1)")
++
++    contaminated = leaked == slot and leaked not in bp_b
++    if contaminated:
++        r.notes.append("  -> pause_rx/tx gravado em slot inexistente no chassi atual")
++
++    # Primeira linha sem correspondência -> permanece 0 -> KeyError
++    virgin = resolve(bp_b, "A", 0)
++    try:
++        _ = bp_b[virgin]
++        r.notes.append("primeira linha sem match -> sem KeyError (inesperado)")
++        crashed = False
++    except KeyError as exc:
++        crashed = True
++        r.notes.append(f"primeira linha sem match -> KeyError: {exc} (mata o processo)")
++
++    r.reproduced = contaminated and crashed
++    return r
++
++
++# --------------------------------------------------------------------------
++# F8 — get_fi_id_from_dn() confunde fabric por substring  (:681)
++# --------------------------------------------------------------------------
++def check_f8() -> Result:
++    r = Result("F8", "get_fi_id_from_dn() atribui fabric errado por substring", False)
++
++    def get_fi_id_from_dn(dn: str):
++        if "A" in dn:
++            return "A"
++        elif "B" in dn:
++            return "B"
++        return None
++
++    cases = [
++        ("sys/switch-A/slot-1/switch-ether/port-1", "A"),
++        ("sys/switch-B/slot-1/switch-ether/port-1", "B"),
++        ("fabric/lan/B/net-VLAN_A", "B"),  # rótulo do usuário com 'A'
++    ]
++    for dn, expected in cases:
++        got = get_fi_id_from_dn(dn)
++        mark = "OK " if got == expected else "ERRO"
++        r.notes.append(f"{mark} {dn} -> {got} (esperado {expected})")
++        if got != expected:
++            r.reproduced = True
++    return r
++
++
++# --------------------------------------------------------------------------
++# F9 — isFloat() valida com float() mas converte com int()  (:696)
++# --------------------------------------------------------------------------
++def check_f9() -> Result:
++    r = Result("F9", "get_speed_num_from_string() levanta ValueError não tratado", False)
++
++    def is_float(val) -> bool:
++        try:
++            float(val)
++            return True
++        except ValueError:
++            return False
++
++    def get_speed_num_from_string(speed):
++        if is_float(speed):
++            return int(speed)
++        if "gbps" in str(speed):
++            return int(str(speed).rstrip("gbps"))
++        return 0
++
++    for v in ("10", "10gbps", "100gbps"):
++        r.notes.append(f"OK   {v!r} -> {get_speed_num_from_string(v)}")
++
++    for v in ("10.5", "nan", "inf"):
++        try:
++            get_speed_num_from_string(v)
++            r.notes.append(f"     {v!r} -> sem exceção (inesperado)")
++        except ValueError as exc:
++            r.reproduced = True
++            r.notes.append(f"ERRO {v!r} -> ValueError: {exc}")
++
++    r.notes.append(f"rstrip vs removesuffix: {'sgbps'.rstrip('gbps')!r} (esperado 's')")
++    return r
++
++
++# --------------------------------------------------------------------------
++# F10 — 'associated' é substring de 'unassociated'  (:2645, :2733)
++# --------------------------------------------------------------------------
++def check_f10() -> Result:
++    r = Result("F10", "Filtro de estado por substring aceita blade não associado", False)
++
++    for assoc in ("associated", "unassociated", "associating", "removing"):
++        emitted = not ("associated" not in assoc)
++        mark = "ERRO" if assoc == "unassociated" and emitted else "OK  "
++        r.notes.append(f"{mark} association={assoc!r:16} -> passa no filtro: {emitted}")
++        if assoc == "unassociated" and emitted:
++            r.reproduced = True
++
++    r.notes.append("  mascarado hoje pela condição combinada com oper_state;")
++    r.notes.append("  exposto quando oper_state='ok' e association='unassociated'")
++    return r
++
++
++# --------------------------------------------------------------------------
++# F11 — cleanup_ucs_connections() com --no-ssh  (:607-614, :474)
++# --------------------------------------------------------------------------
++def check_f11() -> Result:
++    r = Result("F11", "cleanup_ucs_connections() quebra com --no-ssh / login falho", False)
++
++    def cleanup(conn_dict: dict) -> None:
++        for _domain_ip, handles in conn_dict.items():
++            cli_handle = handles["cli"]      # :608
++            sdk_handle = handles["sdk"]
++            cli_handle.disconnect()          # :613
++            sdk_handle.logout()
++
++    # --no-ssh: connect_and_pull_stats() retorna em :474 antes de setar 'cli'
++    try:
++        cleanup({"10.1.1.1": {"sdk": object()}})
++        r.notes.append("--no-ssh -> sem exceção (inesperado)")
++    except KeyError as exc:
++        r.reproduced = True
++        r.notes.append(f"--no-ssh -> KeyError: {exc}")
++
++    # login falhou: handle é None, sem None-check
++    try:
++        cleanup({"10.1.1.1": {"cli": None, "sdk": None}})
++        r.notes.append("login falho -> sem exceção (inesperado)")
++    except AttributeError as exc:
++        r.notes.append(f"login falho -> AttributeError: {exc}")
++    return r
++
++
++CHECKS: dict[str, Callable[[], Result]] = {
++    "F1": check_f1,
++    "F3": check_f3,
++    "F5": check_f5,
++    "F7": check_f7,
++    "F8": check_f8,
++    "F9": check_f9,
++    "F10": check_f10,
++    "F11": check_f11,
++}
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--finding", choices=sorted(CHECKS), help="roda apenas um achado")
++    args = parser.parse_args()
++
++    selected = [args.finding] if args.finding else list(CHECKS)
++    results = [CHECKS[name]() for name in selected]
++
++    for res in results:
++        if res.skipped:
++            status = "PULADO"
++        elif res.reproduced:
++            status = "REPRODUZIDO"
++        else:
++            status = "NÃO REPRODUZIDO"
++        print(f"\n{'=' * 78}\n{res.finding} — {res.title}\n  status: {status}")
++        for note in res.notes:
++            print(f"    {note}")
++
++    graded = [r for r in results if not r.skipped]
++    failed = [r for r in graded if not r.reproduced]
++    print(f"\n{'=' * 78}")
++    print(f"reproduzidos: {len(graded) - len(failed)}/{len(graded)}"
++          f"   pulados: {len(results) - len(graded)}")
++    if failed:
++        print("não reproduzidos: " + ", ".join(r.finding for r in failed))
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+
+
+From 54b7f11d91945be94942687a2d884ba94d80789e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 21 Sep 2026 02:00:08 +0000
+Subject: [PATCH 2/7] Apply the five quick fixes from the RFC (section 9)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Correções pontuais de baixo risco, independentes da refatoração estrutural.
+Nenhuma altera o formato das séries existentes; o único dado novo é a
+medição UTMCollectorHealth.
+
+F5 - print_output_in_influxdb_lp() consultava per_ru_dict, variável de loop
+vazada, em vez de ru_dict. Em domínio sem rack units (só blades, com FEX
+cujo backplane tem peer rack) isso levantava UnboundLocalError e descartava
+o ciclo inteiro de todos os domínios. Medido em fixture realista: antes 0
+linhas, depois 7. O peer passou a usar nome próprio para não sobrescrever a
+variável do loop externo.
+
+F1/F2 - o .pickle carrega usuário e senha do UCS em texto claro, porque o
+UcsHandle guarda ambos como atributos de instância, e nascia com modo 0644.
+open_pickle_file_for_write() cria com 0600 e aperta arquivo pré-existente;
+pickle_file_is_safe_to_load() recusa carregar arquivo de outro dono ou
+gravável por grupo/outros, já que pickle.load() executa o que lê. Apagar os
+arquivos antigos continua sendo ação na VM (QUICK_FIXES.md).
+
+F11 - cleanup_ucs_connections() fazia handles['cli'] e .disconnect() sem
+checagem: KeyError com --no-ssh, AttributeError com login falho, justo no
+caminho que roda quando algo já deu errado. Agora usa .get(), checa None e
+isola cada handle, para que uma sessão travada não impeça as demais de
+fecharem.
+
+F6 - tools/audit_stats_interval.py compara os três intervalos que precisam
+coincidir para a banda estar correta: stats collection policy do UCSM,
+interval do inputs.exec e [[polling_interval]] do dashboard. Verificado
+neste repo que os dashboards assumem 60s; falta confirmar a policy do UCSM.
+
+F4 - print_collector_health() emite uma linha por domínio ao final de todo
+ciclo, inclusive quando ele falha, para distinguir coleta quebrada de porta
+sem tráfego. update_stats_dict() passou a ser chamada dentro de try/except,
+como as outras duas etapas já eram: antes, uma exceção de parsing matava o
+processo, perdia o ciclo e pulava pickle_connections(), deixando as sessões
+UCS abertas até expirarem.
+
+Verificação: tests/test_quick_fixes.py importa o coletor real com
+ucsmsdk/netmiko stubados. 16/16 passam no código corrigido e 0/16 no
+anterior, com os modos de falha esperados. Diff de paridade do output no
+caminho sem o gatilho de F5: idêntico. Todos os arquivos que rodam na VM
+foram validados contra a sintaxe do Python 3.6.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+(cherry picked from commit c0f276e3d206191af94edc2065b3708b33c9cadd)
+---
+ .../2026-09-20-utm-modernization-rfc.md       |   5 +
+ docs/refactor/QUICK_FIXES.md                  | 159 +++++++++
+ docs/refactor/README.md                       |  32 +-
+ docs/refactor/poc/verify_findings.py          |  15 +-
+ telegraf/ucs_traffic_monitor.py               | 229 ++++++++++--
+ tests/test_quick_fixes.py                     | 331 ++++++++++++++++++
+ tools/audit_stats_interval.py                 | 259 ++++++++++++++
+ 7 files changed, 994 insertions(+), 36 deletions(-)
+ create mode 100644 docs/refactor/QUICK_FIXES.md
+ create mode 100644 tests/test_quick_fixes.py
+ create mode 100755 tools/audit_stats_interval.py
+
+diff --git a/docs/refactor/2026-09-20-utm-modernization-rfc.md b/docs/refactor/2026-09-20-utm-modernization-rfc.md
+index 506fd97..7d81e4f 100644
+--- a/docs/refactor/2026-09-20-utm-modernization-rfc.md
++++ b/docs/refactor/2026-09-20-utm-modernization-rfc.md
+@@ -702,6 +702,11 @@ Alvo: **≥ 80 % em `transform/` e `exporters/`**. Smoke test em `collectors/` c
+ 
+ ## 9. Correções pontuais — antes de qualquer refatoração
+ 
++> **Status: aplicadas.** Ver [`QUICK_FIXES.md`](QUICK_FIXES.md) para o
++> detalhe de cada uma, o que foi medido e os passos que ainda dependem
++> de ação na VM (apagar os `.pickle` antigos e rodar a auditoria de
++> intervalos). Regressão em `tests/test_quick_fixes.py`.
++
+ Cinco itens de baixo risco, alto retorno, independentes do RFC:
+ 
+ 1. **F5 — uma palavra.** `:2793`: trocar `per_ru_dict` por `ru_dict`. Elimina a perda total de ciclo em domínios só com blades + FEX.
+diff --git a/docs/refactor/QUICK_FIXES.md b/docs/refactor/QUICK_FIXES.md
+new file mode 100644
+index 0000000..63824bd
+--- /dev/null
++++ b/docs/refactor/QUICK_FIXES.md
+@@ -0,0 +1,159 @@
++# Correções pontuais — RFC seção 9
++
++Status das cinco correções propostas para aplicação imediata, antes de
++qualquer refatoração estrutural. Todas são de baixo risco e independentes
++entre si.
++
++| # | Correção | Onde | Status |
++|---|---|---|---|
++| 1 | F5 — variável de loop vazada | `telegraf/ucs_traffic_monitor.py` | ✅ aplicada |
++| 2 | F1/F2 — contenção do `.pickle` | `telegraf/ucs_traffic_monitor.py` | ✅ código / ⚠️ ação na VM |
++| 3 | F11 — cleanup com `--no-ssh` | `telegraf/ucs_traffic_monitor.py` | ✅ aplicada |
++| 4 | F6/H1 — auditoria de intervalos | `tools/audit_stats_interval.py` | ✅ ferramenta / ⚠️ rodar na VM |
++| 5 | F4 — métrica de saúde | `telegraf/ucs_traffic_monitor.py` | ✅ aplicada |
++
++Nenhuma altera o formato das séries existentes. O único dado novo é a
++medição `UTMCollectorHealth`.
++
++---
++
++## 1. F5 — lookup no dicionário errado
++
++`print_output_in_influxdb_lp()` consultava `per_ru_dict` (variável de loop
++vazada) em vez de `ru_dict`. Corrigido, e o peer passou a usar um nome
++próprio (`peer_ru_dict`) para não sobrescrever a variável do loop externo.
++
++**Impacto medido.** Numa topologia com blades, chassi e um FEX cuja porta de
++backplane tem peer rack-unit, com `ru` vazio:
++
++```
++original:  0 linhas   (UnboundLocalError — ciclo inteiro perdido)
++corrigido: 7 linhas
++```
++
++Em domínios sem esse gatilho o output é byte a byte idêntico ao anterior
++(verificado com 6 linhas em fixture com chassi, blade, portas e uplink).
++
++## 2. F1/F2 — contenção do `.pickle`
++
++O `.pickle` carrega usuário e senha do UCS em texto claro, porque o
++`UcsHandle` guarda ambos como atributos de instância. E `pickle.load()`
++executa código vindo do arquivo que lê.
++
++**No código:**
++
++- `open_pickle_file_for_write()` cria o arquivo com `0600` via `os.open` e
++  aplica `os.fchmod` para apertar um arquivo pré-existente com modo frouxo.
++- `pickle_file_is_safe_to_load()` recusa carregar um arquivo que não seja do
++  usuário atual (ou root) ou que seja gravável por grupo/outros. Nesse caso
++  o coletor começa sem sessões salvas em vez de carregar algo não confiável.
++
++Antes: o arquivo nascia `0644` — legível por qualquer conta da VM, com a
++senha dentro. Confirmado em execução ponta a ponta.
++
++**⚠️ Ação pendente na VM** — o código protege arquivos novos, mas não apaga
++os antigos:
++
++```sh
++# 1. Confirmar o problema (H3)
++sudo strings /usr/local/telegraf/ucs_traffic_monitor_*.pickle | grep -i -A2 passw
++
++# 2. Parar o telegraf antes de mexer
++sudo systemctl stop telegraf
++
++# 3. Apagar de forma irrecuperável
++sudo shred -u /usr/local/telegraf/ucs_traffic_monitor_*.pickle
++
++# 4. Subir de novo — o coletor recria com 0600
++sudo systemctl start telegraf
++sudo stat -c '%a %U:%G %n' /usr/local/telegraf/ucs_traffic_monitor_*.pickle
++```
++
++Se o passo 1 mostrar a senha, **trate-a como comprometida**: ela esteve
++legível em todo snapshot e backup da VM. Rode a troca no UCSM.
++
++A remoção definitiva do `pickle` é a Fase 1 do RFC.
++
++## 3. F11 — cleanup que quebrava justo no caminho de erro
++
++`cleanup_ucs_connections()` fazia `handles['cli']` e chamava `.disconnect()`
++sem checagem. Com `--no-ssh` a chave `cli` nunca é criada (`KeyError`), e com
++login falho o handle é `None` (`AttributeError`). Corrigido com `.get()`,
++checagem de `None` e `try/except` por handle — uma sessão que falha ao
++fechar não impede as dos outros domínios de fecharem.
++
++## 4. F6/H1 — auditoria dos três intervalos
++
++`tools/audit_stats_interval.py` compara lado a lado:
++
++```
++ intervalo da stats collection policy do UCSM   (por tipo de stat)
++     ==  intervalo do inputs.exec do Telegraf
++     ==  variável [[polling_interval]] do dashboard
++```
++
++Se divergirem, todo painel de banda está fora de escala pelo fator mostrado.
++
++**⚠️ Rodar na VM:**
++
++```sh
++python3 tools/audit_stats_interval.py \
++    -i /usr/local/telegraf/ucs_domains_group_1.txt \
++    -t /etc/telegraf/telegraf.conf \
++    -d grafana/dashboards/domain_traffic.json
++```
++
++Sai 0 se tudo bate, 1 se diverge. Com `--no-ucs` roda offline e reporta só
++o lado local.
++
++Já verificado neste repositório: **os dashboards assumem 60 s**
++(`[[polling_interval]]` = 60 em 7 dos 9; `local_sys` e `welcome` não usam).
++Falta confirmar a policy do UCSM — é o lado que ninguém checou.
++
++A correção durável é F6 na Fase 2: ler `timeCollected`/`intervals` dos MOs
++e exportar taxa real, tirando a aritmética do dashboard.
++
++## 5. F4 — métrica de saúde da coleta
++
++`print_collector_health()` emite uma linha por domínio ao final de **todo**
++ciclo, inclusive quando ele falha:
++
++```
++UTMCollectorHealth,domain=10.0.0.1 success=1i,sdk_ok=1i,cli_ok=1i,cli_skipped=0i,output_ok=1i,run_duration=12.5,collector_ver="0.52"
++```
++
++`success=0` distingue "coleta falhou" de "porta sem tráfego" — hoje ambos
++aparecem no Grafana simplesmente como série ausente.
++
++Junto, `update_stats_dict()` passou a ser chamada dentro de `try/except`,
++como `get_ucs_stats()` e `print_output()` já eram. Antes, uma exceção de
++parsing matava o processo, o que perdia o ciclo de todos os domínios **e**
++pulava `pickle_connections()`, deixando as sessões UCS abertas até expirarem.
++
++A linha só carrega a tag `domain` (um IP), que não precisa de escape de Line
++Protocol — deliberadamente não inclui `location`, que é texto livre e cairia
++no F3, ainda não corrigido.
++
++**Alertas que isso habilita:**
++
++```sql
++-- Domínio sem coleta bem-sucedida
++SELECT last("success") FROM "UTMCollectorHealth" GROUP BY domain
++```
++
++---
++
++## Verificação
++
++```sh
++python3 tests/test_quick_fixes.py      # 16/16
++```
++
++Os testes importam o coletor real com `ucsmsdk`/`netmiko` stubados, então não
++precisam de UCS nem de dependências externas. Para provar que pegam os bugs,
++rode-os contra o código anterior:
++
++```sh
++git show <commit-anterior>:telegraf/ucs_traffic_monitor.py > /tmp/old.py
++UTM_COLLECTOR=/tmp/old.py python3 tests/test_quick_fixes.py   # 0/16
++```
+diff --git a/docs/refactor/README.md b/docs/refactor/README.md
+index 7deb599..4d7e53f 100644
+--- a/docs/refactor/README.md
++++ b/docs/refactor/README.md
+@@ -3,7 +3,10 @@
+ | Documento | Conteúdo |
+ |---|---|
+ | [`2026-09-20-utm-modernization-rfc.md`](2026-09-20-utm-modernization-rfc.md) | Análise técnica verificada, arquitetura-alvo e plano de migração |
++| [`QUICK_FIXES.md`](QUICK_FIXES.md) | As 5 correções pontuais da seção 9 — status e passos na VM |
+ | [`poc/verify_findings.py`](poc/verify_findings.py) | Reprodução executável dos achados |
++| [`../../tests/test_quick_fixes.py`](../../tests/test_quick_fixes.py) | Testes de regressão das correções |
++| [`../../tools/audit_stats_interval.py`](../../tools/audit_stats_interval.py) | Auditoria dos três intervalos (F6/H1) |
+ 
+ ## Reproduzir os achados
+ 
+@@ -19,20 +22,23 @@ com a referência de linha no docstring.
+ 
+ ## Achados
+ 
+-| # | Achado | Sev. | Correção proposta |
++| # | Achado | Sev. | Situação |
+ |---|---|---|---|
+-| F1 | Senha do UCS em texto claro no `.pickle` | Crítica | Fase 1 — remover o `pickle` |
+-| F2 | `pickle.load()` de arquivo gravável = RCE | Crítica | Fase 1 — remover o `pickle` |
+-| F3 | Injeção de Line Protocol via descrição de porta | Crítica | Fase 2 — escape no exporter |
+-| F4 | Uma exceção descarta o ciclo de todos os domínios | Alta | Fase 3 — isolamento por domínio |
+-| F5 | `UnboundLocalError` em `print_output_in_influxdb_lp()` | Alta | **correção pontual** (`:2793`) |
+-| F6 | Taxa de banda depende de 3 configs não sincronizadas | Alta | Fase 2 — `transform/rates.py` |
+-| F7 | `iom_slot_id` vaza → PAUSE no IOM errado | Alta | Fase 2 — função pura |
+-| F8 | `get_fi_id_from_dn()` erra fabric por substring | Média | Fase 2 — regex ancorada |
+-| F9 | `isFloat()` valida com `float()`, converte com `int()` | Média | Fase 2 |
+-| F10 | `'associated' in 'unassociated'` | Média | Fase 2 — `StrEnum` |
+-| F11 | `cleanup_ucs_connections()` quebra com `--no-ssh` | Média | **correção pontual** (`:607`) |
+-| F12 | `-ct` não controla o timeout do stats pull do SDK | Média | Fase 3 |
++| F1 | Senha do UCS em texto claro no `.pickle` | Crítica | 🟡 contido (`0600`) — remoção do `pickle` na Fase 1 |
++| F2 | `pickle.load()` de arquivo gravável = RCE | Crítica | 🟡 contido (recusa arquivo inseguro) — Fase 1 |
++| F3 | Injeção de Line Protocol via descrição de porta | Crítica | 🔴 aberto — Fase 2, escape no exporter |
++| F4 | Uma exceção descarta o ciclo de todos os domínios | Alta | 🟡 detectável (`UTMCollectorHealth`) — Fase 3 |
++| F5 | `UnboundLocalError` em `print_output_in_influxdb_lp()` | Alta | ✅ **corrigido** |
++| F6 | Taxa de banda depende de 3 configs não sincronizadas | Alta | 🟡 auditável (`tools/`) — Fase 2 |
++| F7 | `iom_slot_id` vaza → PAUSE no IOM errado | Alta | 🔴 aberto — Fase 2 |
++| F8 | `get_fi_id_from_dn()` erra fabric por substring | Média | 🔴 aberto — Fase 2 |
++| F9 | `isFloat()` valida com `float()`, converte com `int()` | Média | 🔴 aberto — Fase 2 |
++| F10 | `'associated' in 'unassociated'` | Média | 🔴 aberto — Fase 2 |
++| F11 | `cleanup_ucs_connections()` quebra com `--no-ssh` | Média | ✅ **corrigido** |
++| F12 | `-ct` não controla o timeout do stats pull do SDK | Média | 🔴 aberto — Fase 3 |
++
++As cinco correções pontuais da seção 9 do RFC estão aplicadas. Detalhes e os
++passos que ainda dependem de ação na VM: [`QUICK_FIXES.md`](QUICK_FIXES.md).
+ 
+ Hipóteses ainda **não** confirmadas (H1–H4) estão na seção 5 do RFC, separadas
+ dos fatos. H1 (divergência entre stat collection policy e `polling_interval`)
+diff --git a/docs/refactor/poc/verify_findings.py b/docs/refactor/poc/verify_findings.py
+index 94a7953..86862cc 100644
+--- a/docs/refactor/poc/verify_findings.py
++++ b/docs/refactor/poc/verify_findings.py
+@@ -1,9 +1,18 @@
+ #!/usr/bin/env python3
+ """Reprodução executável dos achados do RFC 2026-09-20.
+ 
+-Cada verificação extrai o código real de `telegraf/ucs_traffic_monitor.py`
+-(referência de linha no docstring) e demonstra o defeito. Nenhum acesso a
+-UCS é necessário — os achados são determinísticos.
++Cada verificação extrai o código como ele estava quando o achado foi
++registrado (referência de linha no docstring) e demonstra o defeito. Nenhum
++acesso a UCS é necessário — os achados são determinísticos.
++
++IMPORTANTE: este arquivo é o registro histórico dos defeitos. Ele reproduz
++trechos copiados, não importa o coletor, então continua reportando
++REPRODUZIDO mesmo para o que já foi corrigido. Para o estado ATUAL do
++coletor, rode `tests/test_quick_fixes.py`.
++
++Já corrigidos no coletor: F1 e F2 (contidos — arquivo 0600 e recusa de
++carregar arquivo inseguro), F5 e F11. Ainda abertos: F3, F7, F8, F9, F10.
++Ver `docs/refactor/QUICK_FIXES.md`.
+ 
+ Uso:
+     python3 docs/refactor/poc/verify_findings.py
+diff --git a/telegraf/ucs_traffic_monitor.py b/telegraf/ucs_traffic_monitor.py
+index fbfef87..65b948b 100755
+--- a/telegraf/ucs_traffic_monitor.py
++++ b/telegraf/ucs_traffic_monitor.py
+@@ -28,6 +28,13 @@ CONNECTION_REFRESH_INTERVAL = 5400
+ CONNECTION_TIMEOUT = 10
+ MASTER_TIMEOUT = 48
+ 
++# The pickled UcsHandle carries the UCS username and password, so the pickle
++# file must never be readable beyond its owner
++PICKLE_FILE_MODE = 0o600
++# Group/other write on the pickle file would let another account choose what
++# pickle.load() executes in this process
++UNSAFE_PICKLE_MODE_BITS = 0o022
++
+ user_args = {}
+ FILENAME_PREFIX = __file__.replace('.py', '')
+ INSTANCE_NAME = 'utm'
+@@ -265,6 +272,84 @@ def get_ucs_domains():
+         response_time_dict[ip]['sdk_login'] = 0
+         response_time_dict[ip]['sdk_end'] = 0
+ 
++def open_pickle_file_for_write(pickle_file_name):
++    """
++    Open the pickle file for writing with owner-only permissions
++
++    The pickled UcsHandle carries the UCS username and password as instance
++    attributes, so this file holds credentials in the clear. Create it as
++    0600 and tighten an existing file before writing, so a file left behind
++    with loose permissions by an older version is not kept readable.
++
++    Parameters:
++    pickle_file_name (path of the pickle file)
++
++    Returns:
++    file object open in 'w+b', or None if it could not be opened
++
++    """
++
++    try:
++        fd = os.open(pickle_file_name,
++                     os.O_RDWR | os.O_CREAT | os.O_TRUNC,
++                     PICKLE_FILE_MODE)
++    except Exception as e:
++        logger.exception('Error in opening {} : {} : {}.' \
++                        .format(pickle_file_name, type(e).__name__, e))
++        return None
++
++    try:
++        # O_CREAT does not change the mode of an existing file
++        os.fchmod(fd, PICKLE_FILE_MODE)
++    except Exception as e:
++        logger.warning('Unable to set mode {:o} on {} : {} : {}' \
++                        .format(PICKLE_FILE_MODE, pickle_file_name, \
++                                type(e).__name__, e))
++
++    return os.fdopen(fd, 'w+b')
++
++def pickle_file_is_safe_to_load(pickle_file_name):
++    """
++    Check that the pickle file can only have been written by its owner
++
++    pickle.load() executes code carried by the data it reads, so loading a
++    file that another account can write hands that account this process.
++    Refuse to load unless the file is owned by this user (or root) and is
++    not writable by group or others.
++
++    Parameters:
++    pickle_file_name (path of the pickle file)
++
++    Returns:
++    True if the file is safe to load, False otherwise
++
++    """
++
++    try:
++        file_stat = os.stat(pickle_file_name)
++    except FileNotFoundError:
++        # Nothing to load. Handled by the caller as a first run
++        return True
++    except Exception as e:
++        logger.warning('Unable to stat {} : {} : {}. Not loading it.' \
++                        .format(pickle_file_name, type(e).__name__, e))
++        return False
++
++    if file_stat.st_uid not in (os.geteuid(), 0):
++        logger.error('{} is owned by uid {}, not by this user ({}) or root.' \
++                     ' Not loading it. Delete it to silence this.' \
++                     .format(pickle_file_name, file_stat.st_uid, os.geteuid()))
++        return False
++
++    unsafe_bits = file_stat.st_mode & UNSAFE_PICKLE_MODE_BITS
++    if unsafe_bits:
++        logger.error('{} is writable beyond its owner (mode {:o}).' \
++                     ' Not loading it. Fix with chmod 600.' \
++                     .format(pickle_file_name, file_stat.st_mode & 0o777))
++        return False
++
++    return True
++
+ def unpickle_connections():
+     """
+     Try to unpickle connections to UCS to re-use open connections
+@@ -299,6 +384,13 @@ def unpickle_connections():
+     pickle_file_name = FILENAME_PREFIX + '_' + INSTANCE_NAME + '.pickle'
+     sdk_time = 0
+ 
++    if not pickle_file_is_safe_to_load(pickle_file_name):
++        # Start from no saved sessions rather than loading an untrusted file
++        for domain_ip in domain_dict:
++            pickled_connections[domain_ip] = {'cli': None, 'sdk': None,
++                                              'sdk_time': 0}
++        return
++
+     try:
+         # Do not open with w+b here. This overwrites the file and gives an
+         # EOFError
+@@ -585,23 +677,40 @@ def cleanup_ucs_connections():
+     None
+ 
+     """
++    '''
++    Use .get() and check for None before closing. The 'cli' key is absent
++    when --no-ssh made connect_and_pull_stats() return before setting it,
++    and either handle is None when the login failed. Both cases used to
++    raise here, in the very path that runs when something already went
++    wrong, leaving the other domains' sessions open on UCSM.
++    '''
+     for domain_ip, handles in conn_dict.items():
+-        cli_handle = handles['cli']
+-        sdk_handle = handles['sdk']
++        cli_handle = handles.get('cli')
++        sdk_handle = handles.get('sdk')
+         logger.debug('Disconnect/Logout session for {} : CLI : {}, SDK : {}'. \
+                     format(domain_ip, cli_handle, sdk_handle))
+-        cli_handle.disconnect()
+-        sdk_handle.logout()
++        if cli_handle is not None:
++            try:
++                cli_handle.disconnect()
++            except Exception as e:
++                logger.warning('Unable to disconnect CLI session for {}: ' \
++                                '{} : {}'.format(domain_ip, \
++                                                 type(e).__name__, e))
++        if sdk_handle is not None:
++            try:
++                sdk_handle.logout()
++            except Exception as e:
++                logger.warning('Unable to logout SDK session for {}: ' \
++                                '{} : {}'.format(domain_ip, \
++                                                 type(e).__name__, e))
+ 
+     # Write an empty dictionary in pickle_file for next time
+     pickle_file_name = FILENAME_PREFIX + '_' + INSTANCE_NAME + '.pickle'
+     empty_dict = {}
+ 
+-    try:
+-        pickle_file = open(pickle_file_name, 'w+b')
+-    except Exception as e:
+-        logger.exception('Error in opening {} : {} : {}. Exit.' \
+-                        .format(pickle_file_name, type(e).__name__, e))
++    pickle_file = open_pickle_file_for_write(pickle_file_name)
++    if pickle_file is None:
++        logger.error('Unable to clear {}'.format(pickle_file_name))
+     else:
+         logger.info('No pickle sessions for next time in {}' \
+                         .format(pickle_file_name))
+@@ -639,11 +748,10 @@ def pickle_connections():
+     for domain_ip, handles in conn_dict.items():
+         handles['cli'] = None
+ 
+-    try:
+-        pickle_file = open(pickle_file_name, 'w+b')
+-    except Exception as e:
+-        logger.exception('Error in opening {} : {} : {}. Exit.' \
+-                        .format(pickle_file_name, type(e).__name__, e))
++    pickle_file = open_pickle_file_for_write(pickle_file_name)
++    if pickle_file is None:
++        logger.error('Unable to save sessions in {}. Next run opens new ' \
++                     'connections.'.format(pickle_file_name))
+     else:
+         logger.info('Pickle sessions for next time in {} : {}' \
+                         .format(pickle_file_name, conn_dict))
+@@ -2770,14 +2878,25 @@ def print_output_in_influxdb_lp():
+                             else:
+                                 ru_dict = d_dict['ru']
+                                 ru_server = per_bp_port_dict['peer']
+-                                if ru_server in per_ru_dict:
+-                                    per_ru_dict = ru_dict[ru_server]
++                                '''
++                                Look up the peer in ru_dict, not in
++                                per_ru_dict. per_ru_dict is the loop variable
++                                of the rack unit loop above: it is unbound
++                                when the domain has no rack units (blade-only
++                                domain with a FEX), which raises
++                                UnboundLocalError and drops the output of
++                                every domain in this run. Use a separate name
++                                for the peer so the outer loop variable is
++                                never rebound here.
++                                '''
++                                if ru_server in ru_dict:
++                                    peer_ru_dict = ru_dict[ru_server]
+                                     bp_tags = bp_tags + \
+                                             ',peer_service_profile=' + \
+-                                            per_ru_dict['service_profile']
++                                            peer_ru_dict['service_profile']
+                                 else:
+                                     logger.info('Know peer_type for {} but' \
+-                                    ' cannot find it in per_ru_dict' \
++                                    ' cannot find it in ru_dict' \
+                                     .format(per_bp_port_dict['peer']))
+                     bp_tags, bp_fields = \
+                                 influxdb_lp_bp_ports(per_bp_port_dict, \
+@@ -2805,6 +2924,55 @@ def print_output():
+         print_output_in_influxdb_lp()
+         logger.info('Printing output - DONE')
+ 
++def print_collector_health(output_ok, run_duration):
++    """
++    Print one health line per UCS domain, whatever else happened in this run
++
++    Without this, a failed collection and a domain with no traffic look
++    exactly the same in Grafana: both are simply missing series. This must
++    stay cheap and defensive, because it runs after a failure too. It emits
++    no tag other than the domain IP, which needs no Line Protocol escaping.
++
++    Parameters:
++    output_ok (False if printing the stats raised)
++    run_duration (seconds taken by this run)
++
++    Returns:
++    None
++
++    """
++
++    if user_args.get('output_format') != 'influxdb-lp' or \
++            user_args.get('verify_only'):
++        return
++
++    no_ssh = bool(user_args.get('no_ssh'))
++    health_lines = ''
++
++    for domain_ip in domain_dict:
++        sdk_ok = bool(raw_sdk_stats.get(domain_ip))
++        cli_ok = True if no_ssh else bool(raw_cli_stats.get(domain_ip))
++        collection_ok = sdk_ok and cli_ok
++        success = collection_ok and output_ok
++
++        health_lines = health_lines + \
++            'UTMCollectorHealth,domain=' + domain_ip + \
++            ' success=' + ('1i' if success else '0i') + \
++            ',sdk_ok=' + ('1i' if sdk_ok else '0i') + \
++            ',cli_ok=' + ('1i' if cli_ok else '0i') + \
++            ',cli_skipped=' + ('1i' if no_ssh else '0i') + \
++            ',output_ok=' + ('1i' if output_ok else '0i') + \
++            ',run_duration=' + str(round(run_duration, 3)) + \
++            ',collector_ver="' + __version__ + '"' + '\n'
++
++        if not success:
++            logger.warning('Collection unhealthy for {}: sdk_ok={}, ' \
++                           'cli_ok={}, output_ok={}'.format(domain_ip, \
++                            sdk_ok, cli_ok, output_ok))
++
++    if health_lines:
++        print(health_lines, end='')
++
+ ###############################################################################
+ # END: Output functions
+ ###############################################################################
+@@ -2838,19 +3006,40 @@ def main(argv):
+ 
+     connect_time = time.time()
+ 
+-    # Parse the stats returned by UCS
+-    update_stats_dict()
++    '''
++    Parse the stats returned by UCS. Wrapped like get_ucs_stats() and
++    print_output() are: an exception here used to kill the process, which
++    lost the run for every domain AND skipped pickle_connections(), leaving
++    the UCS sessions of this run open until they timed out.
++    '''
++    try:
++        update_stats_dict()
++    except Exception as e:
++        logger.exception('Exception with update_stats_dict:{}' \
++                         .format((str)(e)))
+ 
+     parse_time = time.time()
+ 
+     # Print the stats as per the desired output format
++    output_ok = True
+     try:
+         print_output()
+     except Exception as e:
++        output_ok = False
+         logger.exception('Exception with print_output:{}'.format((str)(e)))
+ 
+     output_time = time.time()
+ 
++    '''
++    Report collection health whatever happened above, so that a failed run
++    is distinguishable from a quiet one in the time series
++    '''
++    try:
++        print_collector_health(output_ok, (output_time - start_time))
++    except Exception as e:
++        logger.exception('Exception with print_collector_health:{}' \
++                         .format((str)(e)))
++
+     # Final tasks
+     pickle_connections()
+ 
+diff --git a/tests/test_quick_fixes.py b/tests/test_quick_fixes.py
+new file mode 100644
+index 0000000..874b576
+--- /dev/null
++++ b/tests/test_quick_fixes.py
+@@ -0,0 +1,331 @@
++#!/usr/bin/python3
++"""Regression tests for the five quick fixes (RFC 2026-09-20, section 9).
++
++These import the real telegraf/ucs_traffic_monitor.py and exercise the fixed
++code paths. ucsmsdk and netmiko are stubbed, so no UCS and no third-party
++package is needed.
++
++Runs standalone or under pytest:
++    python3 tests/test_quick_fixes.py
++    pytest tests/test_quick_fixes.py
++"""
++
++# Kept compatible with Python 3.6, the CentOS 7 UTM VM's interpreter.
++import importlib.util
++import io
++import os
++import pickle
++import stat
++import sys
++import tempfile
++import types
++from contextlib import redirect_stdout
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++# UTM_COLLECTOR points the suite at another copy of the collector, which is
++# how these tests are checked against the pre-fix code: they must fail there.
++COLLECTOR = Path(os.environ.get(
++    "UTM_COLLECTOR", REPO_ROOT / "telegraf" / "ucs_traffic_monitor.py"))
++
++
++def _load_collector():
++    """Import the collector with its UCS dependencies stubbed out."""
++    for name, attr in (("ucsmsdk", None),
++                       ("ucsmsdk.ucshandle", "UcsHandle"),
++                       ("netmiko", "ConnectHandler")):
++        if name in sys.modules:
++            continue
++        module = types.ModuleType(name)
++        if attr:
++            setattr(module, attr, object)
++        sys.modules[name] = module
++
++    spec = importlib.util.spec_from_file_location("utm_under_test", COLLECTOR)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++utm = _load_collector()
++
++
++def _reset_state():
++    """Clear the collector's module-level state between tests."""
++    for name in ("stats_dict", "domain_dict", "conn_dict",
++                 "raw_sdk_stats", "raw_cli_stats", "pickled_connections"):
++        getattr(utm, name).clear()
++    utm.user_args.clear()
++
++
++def _minimal_domain(fex_peer_type="S-rack", with_rack_unit=False):
++    """Smallest stats_dict that reaches the FEX backplane branch of the output."""
++    fi = {
++        "load": "1", "total_memory": "1", "mem_available": "1",
++        "model": "UCS-FI-6454", "serial": "SAL0000", "oob_if_ip": "10.0.0.2",
++        "fi_fw_sys_ver": "4.2(3d)", "ha_ready": "yes", "leadership": "primary",
++        "fi_ports": {},
++    }
++    domain = {
++        "location": "DC1", "mode": "cluster", "name": "utm-lab", "uptime": 1,
++        "ucsm_fw_ver": "4.2(3d)",
++        "A": dict(fi), "B": dict(fi),
++        "chassis": {}, "ru": {}, "fex": {
++            "fex-3": {"bp_ports": {"1": {"01": {
++                "fi_id": "A",
++                "peer_type": fex_peer_type,
++                "peer": "rack-unit-5",
++                "peer_port": "1/1",
++                "oper_state": "up",
++                "oper_speed": 40,
++            }}}}
++        },
++    }
++    if with_rack_unit:
++        # Full key set, because the rack unit loop runs before the FEX loop
++        # and feeds influxdb_lp_server_fields()
++        domain["ru"] = {"rack-unit-5": {
++            "service_profile": "SP-ESX-05",
++            "admin_state": "in-service", "association": "associated",
++            "operability": "operable", "oper_state": "ok",
++            "oper_state_code": 0, "memory": "262144",
++            "model": "UCSC-C220-M5SX", "num_adaptors": "1",
++            "num_cores": "32", "num_cpus": "2",
++            "num_vEths": "2", "num_vFCs": "2", "serial": "WZP0000",
++            "adaptors": {},
++        }}
++    return domain
++
++
++# --------------------------------------------------------------------------
++# F5 — leaked loop variable in print_output_in_influxdb_lp()  (:2793)
++# --------------------------------------------------------------------------
++def test_f5_fex_peer_without_rack_units_still_emits_output():
++    """Blade-only domain plus a FEX with a rack peer used to raise
++    UnboundLocalError, which dropped the whole run's output."""
++    _reset_state()
++    utm.user_args.update(output_format="influxdb-lp", verify_only=False)
++    utm.stats_dict["10.0.0.1"] = _minimal_domain(with_rack_unit=False)
++
++    captured = io.StringIO()
++    with redirect_stdout(captured):
++        utm.print_output_in_influxdb_lp()
++
++    output = captured.getvalue()
++    assert "FIEnvStats" in output, "run produced no output at all"
++    assert "BackplanePortStats" in output, "FEX backplane line missing"
++    # No peer in ru_dict, so the tag must simply be absent - not a crash
++    assert "peer_service_profile" not in output
++
++
++def test_f5_fex_peer_with_rack_unit_emits_peer_service_profile():
++    """When the peer IS in ru_dict the tag must appear. Before the fix the
++    lookup hit the leaked loop variable and silently never matched."""
++    _reset_state()
++    utm.user_args.update(output_format="influxdb-lp", verify_only=False)
++    utm.stats_dict["10.0.0.1"] = _minimal_domain(with_rack_unit=True)
++
++    captured = io.StringIO()
++    with redirect_stdout(captured):
++        utm.print_output_in_influxdb_lp()
++
++    assert "peer_service_profile=SP-ESX-05" in captured.getvalue()
++
++
++# --------------------------------------------------------------------------
++# F11 — cleanup_ucs_connections() with --no-ssh or a failed login  (:607)
++# --------------------------------------------------------------------------
++class _FakeHandle:
++    def __init__(self):
++        self.closed = False
++
++    def disconnect(self):
++        self.closed = True
++
++    def logout(self):
++        self.closed = True
++
++
++class _RaisingHandle:
++    def disconnect(self):
++        raise OSError("socket already gone")
++
++    def logout(self):
++        raise OSError("socket already gone")
++
++
++def _run_cleanup(conn_dict):
++    _reset_state()
++    utm.user_args.update(output_format="influxdb-lp")
++    utm.conn_dict.update(conn_dict)
++    with tempfile.TemporaryDirectory() as tmp:
++        original_prefix = utm.FILENAME_PREFIX
++        utm.FILENAME_PREFIX = str(Path(tmp) / "utm")
++        try:
++            utm.cleanup_ucs_connections()
++        finally:
++            utm.FILENAME_PREFIX = original_prefix
++
++
++def test_f11_missing_cli_key_does_not_raise():
++    """--no-ssh returns before setting conn_dict[ip]['cli'] -> used to KeyError."""
++    sdk = _FakeHandle()
++    _run_cleanup({"10.0.0.1": {"sdk": sdk}})
++    assert sdk.closed, "SDK session was not logged out"
++
++
++def test_f11_none_handles_do_not_raise():
++    """A failed login leaves None handles -> used to AttributeError."""
++    _run_cleanup({"10.0.0.1": {"cli": None, "sdk": None}})
++
++
++def test_f11_one_broken_handle_does_not_block_the_others():
++    """A domain whose disconnect raises must not strand the other domains."""
++    healthy = _FakeHandle()
++    _run_cleanup({
++        "10.0.0.1": {"cli": _RaisingHandle(), "sdk": _RaisingHandle()},
++        "10.0.0.2": {"cli": healthy, "sdk": _FakeHandle()},
++    })
++    assert healthy.closed, "second domain was skipped after the first raised"
++
++
++# --------------------------------------------------------------------------
++# F1/F2 — pickle file permissions and refusal to load an unsafe file
++# --------------------------------------------------------------------------
++def test_f1_pickle_file_is_created_owner_only():
++    with tempfile.TemporaryDirectory() as tmp:
++        target = Path(tmp) / "sessions.pickle"
++        handle = utm.open_pickle_file_for_write(str(target))
++        assert handle is not None
++        pickle.dump({"x": 1}, handle)
++        handle.close()
++
++        mode = stat.S_IMODE(target.stat().st_mode)
++        assert mode == 0o600, f"expected 0600, got {mode:o}"
++
++
++def test_f1_existing_loose_file_is_tightened():
++    with tempfile.TemporaryDirectory() as tmp:
++        target = Path(tmp) / "sessions.pickle"
++        target.write_bytes(b"old")
++        target.chmod(0o644)
++
++        handle = utm.open_pickle_file_for_write(str(target))
++        assert handle is not None
++        handle.close()
++
++        mode = stat.S_IMODE(target.stat().st_mode)
++        assert mode == 0o600, f"loose file kept mode {mode:o}"
++
++
++def test_f2_group_writable_pickle_is_refused():
++    with tempfile.TemporaryDirectory() as tmp:
++        target = Path(tmp) / "sessions.pickle"
++        target.write_bytes(pickle.dumps({}))
++        target.chmod(0o660)
++        assert utm.pickle_file_is_safe_to_load(str(target)) is False
++
++
++def test_f2_owner_only_pickle_is_accepted():
++    with tempfile.TemporaryDirectory() as tmp:
++        target = Path(tmp) / "sessions.pickle"
++        target.write_bytes(pickle.dumps({}))
++        target.chmod(0o600)
++        assert utm.pickle_file_is_safe_to_load(str(target)) is True
++
++
++def test_f2_missing_pickle_is_treated_as_first_run():
++    assert utm.pickle_file_is_safe_to_load("/nonexistent/utm.pickle") is True
++
++
++# --------------------------------------------------------------------------
++# F4 — health line is emitted even when the run failed
++# --------------------------------------------------------------------------
++def _health_output(*, output_ok, sdk, cli, no_ssh=False):
++    _reset_state()
++    utm.user_args.update(output_format="influxdb-lp", verify_only=False,
++                         no_ssh=no_ssh)
++    utm.domain_dict["10.0.0.1"] = ["user", "pass"]
++    if sdk:
++        utm.raw_sdk_stats["10.0.0.1"] = {"TopSystem": ["mo"]}
++    if cli:
++        utm.raw_cli_stats["10.0.0.1"] = {"A": {"pfc_stats": "..."}}
++
++    captured = io.StringIO()
++    with redirect_stdout(captured):
++        utm.print_collector_health(output_ok, 12.5)
++    return captured.getvalue()
++
++
++def test_f4_healthy_run_reports_success():
++    line = _health_output(output_ok=True, sdk=True, cli=True)
++    assert "UTMCollectorHealth,domain=10.0.0.1" in line
++    assert "success=1i" in line
++    assert line.endswith("\n")
++
++
++def test_f4_failed_collection_reports_failure():
++    """The whole point: a failed run must still produce a line saying so."""
++    line = _health_output(output_ok=True, sdk=False, cli=False)
++    assert "success=0i" in line
++    assert "sdk_ok=0i" in line
++
++
++def test_f4_failed_output_reports_failure():
++    line = _health_output(output_ok=False, sdk=True, cli=True)
++    assert "success=0i" in line
++    assert "output_ok=0i" in line
++
++
++def test_f4_no_ssh_does_not_count_as_a_cli_failure():
++    line = _health_output(output_ok=True, sdk=True, cli=False, no_ssh=True)
++    assert "success=1i" in line
++    assert "cli_skipped=1i" in line
++
++
++def test_f4_is_silent_for_the_dict_output_format():
++    _reset_state()
++    utm.user_args.update(output_format="dict", verify_only=False)
++    utm.domain_dict["10.0.0.1"] = ["user", "pass"]
++    captured = io.StringIO()
++    with redirect_stdout(captured):
++        utm.print_collector_health(True, 1.0)
++    assert captured.getvalue() == ""
++
++
++def test_f4_emits_one_line_per_domain():
++    _reset_state()
++    utm.user_args.update(output_format="influxdb-lp", verify_only=False,
++                         no_ssh=True)
++    utm.domain_dict.update({"10.0.0.1": ["u", "p"], "10.0.0.2": ["u", "p"]})
++    utm.raw_sdk_stats["10.0.0.1"] = {"TopSystem": ["mo"]}
++
++    captured = io.StringIO()
++    with redirect_stdout(captured):
++        utm.print_collector_health(True, 1.0)
++
++    lines = captured.getvalue().strip().splitlines()
++    assert len(lines) == 2, f"expected 2 lines, got {len(lines)}"
++    assert "domain=10.0.0.1 success=1i" in lines[0]
++    assert "domain=10.0.0.2 success=0i" in lines[1]
++
++
++def main():
++    tests = [(name, obj) for name, obj in sorted(globals().items())
++             if name.startswith("test_") and callable(obj)]
++    failed = []
++    for name, test in tests:
++        try:
++            test()
++        except Exception as exc:
++            failed.append(name)
++            print(f"FAIL  {name}\n        {type(exc).__name__}: {exc}")
++        else:
++            print(f"ok    {name}")
++
++    print(f"\n{len(tests) - len(failed)}/{len(tests)} passaram")
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/audit_stats_interval.py b/tools/audit_stats_interval.py
+new file mode 100755
+index 0000000..468ee7a
+--- /dev/null
++++ b/tools/audit_stats_interval.py
+@@ -0,0 +1,259 @@
++#!/usr/bin/python3
++"""Audit the three intervals that must agree for UTM bandwidth to be correct.
++
++UTM does not compute a rate. It exports `bytes_rx_delta` / `total_bytes_delta`
++exactly as UCSM reports them, and UCSM computes those deltas over the
++interval of its own stats collection policy. The conversion to a rate happens
++only in Grafana, which divides by the dashboard constant [[polling_interval]].
++
++So a bandwidth figure is only correct when all three agree:
++
++    UCSM stats collection policy interval        (set per stat type in UCSM)
++        == telegraf inputs.exec interval          (set in telegraf.conf)
++        == Grafana [[polling_interval]] variable  (set in each dashboard)
++
++Nothing validates that today. If the port policy sits at 2 minutes while
++[[polling_interval]] is 60, every uplink bandwidth panel reads 2x high, with
++no error anywhere. This tool reports the three values side by side.
++
++The stat types UTM actually reads are port (FI ports), adapter (vNIC/vHBA)
++and chassis (backplane ports).
++
++Usage:
++    ./audit_stats_interval.py -i ucs_domains_group_1.txt \
++                              -t /etc/telegraf/telegraf.conf \
++                              -d ../grafana/dashboards/domain_traffic.json
++
++    ./audit_stats_interval.py -i ucs_domains_group_1.txt --no-ucs   # offline
++
++Exits 0 when the intervals agree, 1 when they diverge, 2 on an error.
++"""
++
++# Kept compatible with Python 3.6, which is what the CentOS 7 UTM VM ships:
++# no PEP 604 unions and no `from __future__ import annotations`.
++import argparse
++import json
++import re
++import sys
++from pathlib import Path
++from typing import Dict, List, Optional, Tuple
++
++# Stat types whose deltas UTM exports. Others are collected by UCSM but
++# unused here, so a mismatch on them does not skew any UTM panel.
++STAT_TYPES_USED_BY_UTM = ("port", "adapter", "chassis")
++
++# StatsCollectionPolicyConsts.COLLECTION_INTERVAL_* -> seconds
++INTERVAL_SECONDS = {
++    "30seconds": 30,
++    "1minute": 60,
++    "2minutes": 120,
++    "5minutes": 300,
++}
++
++
++def parse_domains(input_file):
++    # type: (Path) -> List[Tuple[str, str, str]]
++    """Read the UTM input file: IP,user,password per line, [Location] headers."""
++    domains = []
++    for raw_line in input_file.read_text().splitlines():
++        line = raw_line.strip()
++        if not line or line.startswith("#") or line.startswith("["):
++            continue
++        parts = line.split(",")
++        if len(parts) < 3:
++            print(f"  ! ignoring malformed line: {raw_line!r}", file=sys.stderr)
++            continue
++        domains.append((parts[0], parts[1], parts[2]))
++    return domains
++
++
++def telegraf_exec_interval(telegraf_conf):
++    # type: (Path) -> Optional[int]
++    """Pull the interval of the inputs.exec block that runs this collector."""
++    try:
++        text = telegraf_conf.read_text()
++    except OSError as exc:
++        print(f"  ! cannot read {telegraf_conf}: {exc}", file=sys.stderr)
++        return None
++
++    # Only look at inputs.exec blocks that actually invoke UTM
++    blocks = re.split(r"^\s*\[\[", text, flags=re.MULTILINE)
++    for block in blocks:
++        if not block.startswith("inputs.exec"):
++            continue
++        if "ucs_traffic_monitor" not in block:
++            continue
++        match = re.search(r'^\s*interval\s*=\s*"(\d+)([smh])"',
++                          block, flags=re.MULTILINE)
++        if match:
++            value, unit = int(match.group(1)), match.group(2)
++            return value * {"s": 1, "m": 60, "h": 3600}[unit]
++    return None
++
++
++def dashboard_polling_interval(dashboard_json):
++    # type: (Path) -> Optional[int]
++    """Read the [[polling_interval]] template variable out of a dashboard."""
++    try:
++        dashboard = json.loads(dashboard_json.read_text())
++    except (OSError, json.JSONDecodeError) as exc:
++        print(f"  ! cannot read {dashboard_json}: {exc}", file=sys.stderr)
++        return None
++
++    for variable in dashboard.get("templating", {}).get("list", []):
++        if variable.get("name") != "polling_interval":
++            continue
++
++        # UTM declares it as a constant variable, which carries its value in
++        # "query". Fall back to "current" for the other variable types.
++        candidates = [variable.get("query")]
++        current = variable.get("current")
++        if isinstance(current, dict):
++            candidates += [current.get("value"), current.get("text")]
++
++        for value in candidates:
++            if isinstance(value, list):
++                value = value[0] if value else None
++            if value is None or value == "":
++                continue
++            try:
++                # Some dashboards store it as "60", others as "60.0"
++                seconds = float(str(value))
++            except (TypeError, ValueError):
++                continue
++            if seconds != int(seconds):
++                print(f"  ! polling_interval is fractional ({seconds}) in "
++                      f"{dashboard_json.name}", file=sys.stderr)
++            return int(seconds)
++
++        print(f"  ! polling_interval found but not numeric in "
++              f"{dashboard_json.name}", file=sys.stderr)
++        return None
++    return None
++
++
++def ucsm_policy_intervals(host, user, password):
++    # type: (str, str, str) -> Dict[str, str]
++    """Query StatsCollectionPolicy from a UCS domain. Returns name -> interval."""
++    from ucsmsdk.ucshandle import UcsHandle
++
++    handle = UcsHandle(host, user, password)
++    handle.login(timeout=30)
++    try:
++        policies = handle.query_classid("StatsCollectionPolicy")
++        return {policy.name: policy.collection_interval for policy in policies}
++    finally:
++        handle.logout()
++
++
++def report_domain(host, policies, telegraf_s, dashboard_s):
++    # type: (str, Dict[str, str], Optional[int], Optional[int]) -> bool
++    """Print one domain's comparison. Returns True when everything agrees."""
++    print(f"\n{host}")
++    print(f"  {'stat type':<10} {'UCSM policy':<14} {'telegraf':<10} "
++          f"{'dashboard':<10} verdict")
++    print(f"  {'-' * 62}")
++
++    agreed = True
++    for stat_type in STAT_TYPES_USED_BY_UTM:
++        raw = policies.get(stat_type)
++        if raw is None:
++            print(f"  {stat_type:<10} {'not found':<14} "
++                  f"{'-':<10} {'-':<10} UNKNOWN")
++            agreed = False
++            continue
++
++        ucsm_s = INTERVAL_SECONDS.get(raw)
++        if ucsm_s is None:
++            print(f"  {stat_type:<10} {raw:<14} {'-':<10} {'-':<10} "
++                  f"UNKNOWN INTERVAL")
++            agreed = False
++            continue
++
++        values = [v for v in (ucsm_s, telegraf_s, dashboard_s) if v is not None]
++        if len(values) < 2:
++            verdict = "INCOMPLETE"
++            agreed = False
++        elif len(set(values)) == 1:
++            verdict = "ok"
++        else:
++            verdict = "MISMATCH"
++            agreed = False
++            if dashboard_s and ucsm_s != dashboard_s:
++                factor = ucsm_s / dashboard_s
++                verdict += f"  (panels read {factor:.3g}x off)"
++
++        print(f"  {stat_type:<10} {f'{raw} ({ucsm_s}s)':<14} "
++              f"{str(telegraf_s) + 's' if telegraf_s else '?':<10} "
++              f"{str(dashboard_s) + 's' if dashboard_s else '?':<10} {verdict}")
++
++    return agreed
++
++
++def main():
++    # type: () -> int
++    parser = argparse.ArgumentParser(
++        description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("-i", "--input-file", type=Path, required=True,
++                        help="UTM input file (ucs_domains_group_*.txt)")
++    parser.add_argument("-t", "--telegraf-conf", type=Path,
++                        default=Path("/etc/telegraf/telegraf.conf"),
++                        help="telegraf.conf holding the inputs.exec block")
++    parser.add_argument("-d", "--dashboard", type=Path,
++                        help="dashboard JSON carrying [[polling_interval]]")
++    parser.add_argument("--no-ucs", action="store_true",
++                        help="skip the UCS queries, report the local side only")
++    args = parser.parse_args()
++
++    try:
++        domains = parse_domains(args.input_file)
++    except OSError as exc:
++        print(f"cannot read {args.input_file}: {exc}", file=sys.stderr)
++        return 2
++
++    if not domains:
++        print(f"no domains in {args.input_file}", file=sys.stderr)
++        return 2
++
++    telegraf_s = telegraf_exec_interval(args.telegraf_conf)
++    dashboard_s = (dashboard_polling_interval(args.dashboard)
++                   if args.dashboard else None)
++
++    print(f"telegraf inputs.exec interval : "
++          f"{f'{telegraf_s}s' if telegraf_s else 'not found'}")
++    print(f"dashboard [[polling_interval]]: "
++          f"{f'{dashboard_s}s' if dashboard_s else 'not checked'}")
++
++    if args.no_ucs:
++        print("\n--no-ucs: skipping the UCSM side. Run without it for the "
++              "verdict that matters.")
++        return 0
++
++    all_agreed = True
++    for host, user, password in domains:
++        try:
++            policies = ucsm_policy_intervals(host, user, password)
++        except Exception as exc:
++            print(f"\n{host}\n  ! query failed: {type(exc).__name__}: {exc}",
++                  file=sys.stderr)
++            all_agreed = False
++            continue
++        if not report_domain(host, policies, telegraf_s, dashboard_s):
++            all_agreed = False
++
++    if all_agreed:
++        print("\nAll intervals agree. Bandwidth figures are on the right scale.")
++        return 0
++
++    print("\nIntervals diverge. Until they match, bandwidth panels are off by "
++          "the ratio shown above.\nFix by aligning the UCSM policy to the "
++          "scrape interval, or by setting [[polling_interval]] to the UCSM "
++          "value.\nThe durable fix is F6 in the RFC: read timeCollected / "
++          "intervals in the collector\nand export a real rate, so no dashboard "
++          "constant is involved.")
++    return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+
+
+From 2e86294745dfa33bd414f32d8ed5aa369205f3c0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 03:30:46 +0000
+Subject: [PATCH 3/7] Add preflight check and unpin netmiko for modern Python
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+netmiko abaixo de 4.4.0 importa o telnetlib da stdlib, que o Python 3.13
+removeu. O playbook fixava netmiko==4.0.0, então um host em Python 3.13+ que
+seguiu o playbook não consegue nem importar o coletor: morre no startup com
+ModuleNotFoundError e não produz métrica nenhuma.
+
+Medido: 4.0.0, 4.2.0 e 4.3.0 falham no Python 3.13; 4.4.0 e 4.8.0 passam.
+ucsmsdk 0.9.27 importa sem problema. A suíte de regressão passa 16/16 tanto
+em 3.11 quanto em 3.13, sem DeprecationWarning, e o coletor roda ponta a
+ponta em 3.13 emitindo UTMCollectorHealth e gravando o pickle com 0600.
+
+- tools/preflight.py: checa Python, ucsmsdk, netmiko e a sintaxe do coletor
+  antes de qualquer mudança. Não altera nada; sai 1 e explica o conserto
+  quando o host não está apto. Roda de 3.6 a 3.14 para diagnosticar qualquer
+  host.
+- ansible-install/utm.yml: o pin passa a ser condicional — 4.0.0 só onde o
+  Python é anterior ao 3.7 (CentOS 7), >=4.4.0 no resto.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+(cherry picked from commit 86c10ae9221412d987c811b40ed9f1c056bd342a)
+---
+ ansible-install/utm.yml      |  13 +++-
+ docs/refactor/QUICK_FIXES.md |  25 ++++++++
+ tools/preflight.py           | 120 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 155 insertions(+), 3 deletions(-)
+ create mode 100755 tools/preflight.py
+
+diff --git a/ansible-install/utm.yml b/ansible-install/utm.yml
+index 933be08..b8cb64b 100644
+--- a/ansible-install/utm.yml
++++ b/ansible-install/utm.yml
+@@ -40,11 +40,18 @@
+     register: shell_pip_install
+     changed_when: '"Requirement already satisfied: ucsmsdk" not in shell_pip_install.stdout'
+ 
+-  - name: Install netmiko==4.0.0 via pip using shell (ansible module is failing on CentOS7)
++  # netmiko below 4.4.0 imports the stdlib telnetlib, which Python 3.13
++  # removed, so the old netmiko==4.0.0 pin makes the collector fail at import
++  # on a modern host. 4.4.0 vendors telnetlib as netmiko._telnetlib.
++  # Python 3.6 (CentOS 7) cannot install 4.4.0, so keep the old pin there.
++  - name: Install netmiko via pip using shell (ansible module is failing on CentOS7)
+     shell:
+-      cmd: python3 -m pip install netmiko==4.0.0  # Required to use python 3.6
++      cmd: >
++        python3 -m pip install
++        {{ 'netmiko==4.0.0' if ansible_python_version is version('3.7', '<')
++           else 'netmiko>=4.4.0' }}
+     register: shell_pip_install
+-    changed_when: '"Requirement already satisfied: netmiko==4.0.0" not in shell_pip_install.stdout'
++    changed_when: '"Requirement already satisfied" not in shell_pip_install.stdout'
+ 
+ 
+   - name: Enable service chronyd
+diff --git a/docs/refactor/QUICK_FIXES.md b/docs/refactor/QUICK_FIXES.md
+index 63824bd..34c5d73 100644
+--- a/docs/refactor/QUICK_FIXES.md
++++ b/docs/refactor/QUICK_FIXES.md
+@@ -143,12 +143,37 @@ SELECT last("success") FROM "UTMCollectorHealth" GROUP BY domain
+ 
+ ---
+ 
++## Pré-requisito: a máquina consegue rodar o coletor?
++
++```sh
++python3 tools/preflight.py
++```
++
++Checa versão de Python, `ucsmsdk`, `netmiko` e a sintaxe do coletor. Não altera
++nada. Sai 0 se o host está apto.
++
++**Por que importa:** netmiko abaixo de 4.4.0 importa o `telnetlib` da stdlib,
++que o **Python 3.13 removeu**. O playbook deste repositório fixava
++`netmiko==4.0.0`, então um host em Python 3.13+ que seguiu o playbook **não
++consegue nem importar o coletor** — morre no startup com `ModuleNotFoundError`
++e não produz métrica nenhuma. Corrige com:
++
++```sh
++python3 -m pip install -U 'netmiko>=4.4.0'
++```
++
++Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13; 4.4.0 e 4.8.0 passam.
++`ucsmsdk` 0.9.27 importa sem problema.
++
+ ## Verificação
+ 
+ ```sh
+ python3 tests/test_quick_fixes.py      # 16/16
+ ```
+ 
++Validado em Python 3.11 e 3.13. O coletor e as ferramentas não usam sintaxe
++posterior ao 3.6, então rodam em toda a faixa 3.6 → 3.13+.
++
+ Os testes importam o coletor real com `ucsmsdk`/`netmiko` stubados, então não
+ precisam de UCS nem de dependências externas. Para provar que pegam os bugs,
+ rode-os contra o código anterior:
+diff --git a/tools/preflight.py b/tools/preflight.py
+new file mode 100755
+index 0000000..66bee50
+--- /dev/null
++++ b/tools/preflight.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/python3
++"""Check that this machine can run the UTM collector before anything is changed.
++
++The collector itself is plain Python with no version-sensitive syntax, but its
++two dependencies are not equally portable:
++
++  ucsmsdk  - pure Python, no known upper bound
++  netmiko  - versions below 4.4.0 import the stdlib `telnetlib`, which Python
++             3.13 removed. netmiko 4.4.0 vendors it as netmiko._telnetlib.
++             The project's ansible playbook pins netmiko==4.0.0, so a host on
++             a modern Python that followed the playbook cannot even import the
++             collector: it dies at startup with ModuleNotFoundError, producing
++             no metrics at all.
++
++Run this first. It changes nothing.
++
++    python3 tools/preflight.py
++
++Exits 0 when the host can run the collector, 1 when it cannot.
++"""
++
++# Kept runnable on Python 3.6 through at least 3.14 so it can diagnose any host.
++from __future__ import print_function
++
++import os
++import sys
++
++# netmiko below this vendors nothing and needs the stdlib telnetlib
++NETMIKO_MIN_ON_PY313 = (4, 4, 0)
++
++
++def parse_version(raw):
++    parts = []
++    for chunk in str(raw).split(".")[:3]:
++        digits = ""
++        for ch in chunk:
++            if ch.isdigit():
++                digits += ch
++            else:
++                break
++        parts.append(int(digits) if digits else 0)
++    while len(parts) < 3:
++        parts.append(0)
++    return tuple(parts)
++
++
++def check(label, fn):
++    try:
++        ok, detail = fn()
++    except Exception as exc:                                  # noqa: BLE001
++        ok, detail = False, "{}: {}".format(type(exc).__name__, exc)
++    print("  [{}] {:<22} {}".format("OK" if ok else "!!", label, detail))
++    return ok
++
++
++def check_python():
++    v = sys.version_info
++    detail = "{}.{}.{} ({})".format(v[0], v[1], v[2], sys.executable)
++    return v[0] == 3 and v >= (3, 6), detail
++
++
++def check_ucsmsdk():
++    import ucsmsdk
++    from ucsmsdk.ucshandle import UcsHandle                   # noqa: F401
++    return True, getattr(ucsmsdk, "__version__", "version unknown")
++
++
++def check_netmiko():
++    import netmiko
++    from netmiko import ConnectHandler                        # noqa: F401
++    raw = getattr(netmiko, "__version__", "0")
++    if sys.version_info >= (3, 13) and parse_version(raw) < NETMIKO_MIN_ON_PY313:
++        return False, "{} — needs >= {} on Python 3.13+".format(
++            raw, ".".join(str(n) for n in NETMIKO_MIN_ON_PY313))
++    return True, raw
++
++
++def check_collector_syntax():
++    import ast
++
++    here = os.path.dirname(os.path.abspath(__file__))
++    path = os.path.join(os.path.dirname(here), "telegraf", "ucs_traffic_monitor.py")
++    if not os.path.exists(path):
++        path = os.path.join(here, "ucs_traffic_monitor.py")
++    if not os.path.exists(path):
++        return False, "ucs_traffic_monitor.py not found next to tools/"
++
++    with open(path) as handle:
++        ast.parse(handle.read(), filename=path)
++    return True, path
++
++
++def main():
++    print("UTM preflight")
++    print("-" * 60)
++    results = [
++        check("python", check_python),
++        check("ucsmsdk", check_ucsmsdk),
++        check("netmiko", check_netmiko),
++        check("collector syntax", check_collector_syntax),
++    ]
++    print("-" * 60)
++
++    if all(results):
++        print("Host can run the collector. Continue with the validation steps.")
++        return 0
++
++    print("Host CANNOT run the collector as is.")
++    if sys.version_info >= (3, 13):
++        print("")
++        print("If netmiko is the failing line, this fixes it:")
++        print("    python3 -m pip install -U 'netmiko>=4.4.0'")
++        print("")
++        print("The ansible playbook in this repo pins netmiko==4.0.0, which")
++        print("cannot import on Python 3.13+. That pin needs updating too.")
++    return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+
+
+From be4149116afced6fe4b94557ff5450f51bc95245 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 09:22:06 +0000
+Subject: [PATCH 4/7] Add validation tooling that works in both credential
+ modes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A produção do fork roda o coletor da feat/prod-rollout-grafana-12, que lê
+credenciais de /etc/utm/creds.env (UTM_DOMAINS + UTM_<id>_HOST/USER/PASS) e é
+invocado com `influxdb-lp --instance-name utm`. As ferramentas anteriores só
+entendiam o arquivo ucs_domains_group_*.txt do master. Rodado contra aquele
+coletor, test_quick_fixes dá 0/16: F1, F2, F4, F5 e F11 estão todos lá.
+
+- credsource.py: lê credenciais nos dois modos (-i, --env-file, --from-env).
+  O parser do env file segue o quoting POSIX que o migrate_credentials.py
+  deles grava, inclusive o escape '\'' — conferido contra o próprio script e
+  contra o sh com senha contendo ', ", $ e espaço. Também executa um
+  comando com o env file carregado sem pôr segredo em linha de comando.
+- check_pickle_exposure.py: diz se cada senha configurada está no .pickle,
+  imprimindo só sim/não. Substitui o `strings | grep passw`, que sempre casa
+  com o nome do atributo _UcsSession__password e ainda expõe o valor. Nunca
+  faz unpickle.
+- lp_lint.py: aponta linhas de Line Protocol que o Telegraf rejeitaria (F3),
+  sem imprimir valores. No modo env o GROUP vira a tag location, e o
+  migrate_credentials mantém espaços ("DC São Paulo"), o que quebra a linha.
+- audit_stats_interval.py: aceita os dois modos; lê telegraf.conf e
+  telegraf.d; quando o bloco inputs.exec não declara interval, reporta o
+  herdado do [agent] ou o padrão de 10s do Telegraf em vez de "not found".
+- collect_validation.sh: roda tudo na ordem, detecta modo, Python e usuário
+  do Telegraf pelo telegraf.conf, compara a saída antes/depois em cópias
+  isoladas (instância própria, como o usuário do Telegraf) e mascara IPs.
+  Não escreve em UTM_DIR nem reinicia serviço. shellcheck limpo.
+- preflight.py e test_quick_fixes.py: aceitam o coletor do modo env (com
+  credentials.py ao lado) e qualquer layout via UTM_COLLECTOR.
+- VALIDACAO.md: o roteiro para a VM.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+(cherry picked from commit 5bf63d9c89c14a6e4fa6c92bee719edbbc178912)
+---
+ docs/refactor/QUICK_FIXES.md   |  21 ++-
+ docs/refactor/README.md        |   6 +
+ docs/refactor/VALIDACAO.md     | 109 ++++++++++++
+ tests/test_quick_fixes.py      |   8 +
+ tools/audit_stats_interval.py  | 161 ++++++++++-------
+ tools/check_pickle_exposure.py | 117 +++++++++++++
+ tools/collect_validation.sh    | 308 +++++++++++++++++++++++++++++++++
+ tools/credsource.py            | 160 +++++++++++++++++
+ tools/lp_lint.py               | 140 +++++++++++++++
+ tools/preflight.py             |  45 ++++-
+ 10 files changed, 998 insertions(+), 77 deletions(-)
+ create mode 100644 docs/refactor/VALIDACAO.md
+ create mode 100755 tools/check_pickle_exposure.py
+ create mode 100755 tools/collect_validation.sh
+ create mode 100755 tools/credsource.py
+ create mode 100755 tools/lp_lint.py
+
+diff --git a/docs/refactor/QUICK_FIXES.md b/docs/refactor/QUICK_FIXES.md
+index 34c5d73..bdf2637 100644
+--- a/docs/refactor/QUICK_FIXES.md
++++ b/docs/refactor/QUICK_FIXES.md
+@@ -55,8 +55,13 @@ senha dentro. Confirmado em execução ponta a ponta.
+ os antigos:
+ 
+ ```sh
+-# 1. Confirmar o problema (H3)
+-sudo strings /usr/local/telegraf/ucs_traffic_monitor_*.pickle | grep -i -A2 passw
++# 1. Confirmar o problema (H3) sem imprimir a senha
++#    (um `strings | grep passw` sempre casa com o NOME do atributo e ainda
++#    joga o valor na tela; esta ferramenta compara bytes e diz só sim/não)
++sudo -u telegraf python3 tools/check_pickle_exposure.py \
++    --env-file /etc/utm/creds.env /usr/local/telegraf/*.pickle      # modo env
++sudo -u telegraf python3 tools/check_pickle_exposure.py \
++    -i ucs_domains_group_1.txt /usr/local/telegraf/*.pickle         # modo arquivo
+ 
+ # 2. Parar o telegraf antes de mexer
+ sudo systemctl stop telegraf
+@@ -97,12 +102,14 @@ Se divergirem, todo painel de banda está fora de escala pelo fator mostrado.
+ **⚠️ Rodar na VM:**
+ 
+ ```sh
+-python3 tools/audit_stats_interval.py \
+-    -i /usr/local/telegraf/ucs_domains_group_1.txt \
+-    -t /etc/telegraf/telegraf.conf \
+-    -d grafana/dashboards/domain_traffic.json
++python3 tools/audit_stats_interval.py --env-file /etc/utm/creds.env   # modo env
++python3 tools/audit_stats_interval.py -i ucs_domains_group_1.txt      # modo arquivo
+ ```
+ 
++Lê `/etc/telegraf/telegraf.conf` e `telegraf.d/` por padrão. Se o bloco
++`inputs.exec` não declara `interval`, reporta o herdado do `[agent]` — ou o
++padrão de 10 s do Telegraf, que é justamente o caso que mais desalinha.
++
+ Sai 0 se tudo bate, 1 se diverge. Com `--no-ucs` roda offline e reporta só
+ o lado local.
+ 
+@@ -167,6 +174,8 @@ Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13; 4.4.0 e 4.8.0 passam.
+ 
+ ## Verificação
+ 
++Roteiro completo para a VM, com coleta automática: [`VALIDACAO.md`](VALIDACAO.md).
++
+ ```sh
+ python3 tests/test_quick_fixes.py      # 16/16
+ ```
+diff --git a/docs/refactor/README.md b/docs/refactor/README.md
+index 4d7e53f..9eba702 100644
+--- a/docs/refactor/README.md
++++ b/docs/refactor/README.md
+@@ -6,7 +6,13 @@
+ | [`QUICK_FIXES.md`](QUICK_FIXES.md) | As 5 correções pontuais da seção 9 — status e passos na VM |
+ | [`poc/verify_findings.py`](poc/verify_findings.py) | Reprodução executável dos achados |
+ | [`../../tests/test_quick_fixes.py`](../../tests/test_quick_fixes.py) | Testes de regressão das correções |
++| [`VALIDACAO.md`](VALIDACAO.md) | Roteiro de validação na VM, nos dois modos de credencial |
++| [`../../tools/collect_validation.sh`](../../tools/collect_validation.sh) | Coleta automática do relatório de validação |
++| [`../../tools/preflight.py`](../../tools/preflight.py) | O host consegue rodar o coletor? (Python, ucsmsdk, netmiko) |
+ | [`../../tools/audit_stats_interval.py`](../../tools/audit_stats_interval.py) | Auditoria dos três intervalos (F6/H1) |
++| [`../../tools/check_pickle_exposure.py`](../../tools/check_pickle_exposure.py) | Senha em texto claro no `.pickle`? Responde sim/não sem imprimi-la (F1) |
++| [`../../tools/lp_lint.py`](../../tools/lp_lint.py) | Linhas de Line Protocol que o Telegraf rejeitaria (F3) |
++| [`../../tools/credsource.py`](../../tools/credsource.py) | Leitura de credenciais nos modos arquivo e `creds.env` |
+ 
+ ## Reproduzir os achados
+ 
+diff --git a/docs/refactor/VALIDACAO.md b/docs/refactor/VALIDACAO.md
+new file mode 100644
+index 0000000..0877027
+--- /dev/null
++++ b/docs/refactor/VALIDACAO.md
+@@ -0,0 +1,109 @@
++# Validação das correções na VM de produção
++
++Roteiro para validar as cinco correções pontuais (RFC seção 9) no host real e
++trazer os resultados para análise. **Nada aqui altera a produção**: não escreve
++em `/usr/local/telegraf`, não mexe no `telegraf.conf` e não reinicia serviço.
++
++## Os dois modos de credencial
++
++O pacote traz o coletor corrigido nas duas variantes que existem no fork, e o
++script detecta sozinho qual a produção usa:
++
++| Modo | Origem | Credenciais | Invocação no Telegraf |
++|---|---|---|---|
++| `file` | `master` / upstream | `ucs_domains_group_*.txt` | `ucs_traffic_monitor.py <arquivo> influxdb-lp` |
++| `env` | `feat/credentials-env-vars` → `feat/prod-rollout-grafana-12` | `/etc/utm/creds.env` | `ucs_traffic_monitor.py influxdb-lp --instance-name utm` |
++
++Promover a variante errada quebra a coleta: o argparse de cada uma rejeita a
++invocação da outra.
++
++## Passo 0 — o host consegue rodar o coletor?
++
++```sh
++tar xzf utm-validacao.tar.gz && cd utm-validacao
++python3 tools/preflight.py
++```
++
++Use **o mesmo Python que o Telegraf usa** — o primeiro termo do `commands` no
++bloco `inputs.exec`. Se for um venv, rode com ele (`/opt/utm-venv/bin/python
++tools/preflight.py`).
++
++O ponto que costuma falhar em Python 3.13+ é o `netmiko`: abaixo de 4.4.0 ele
++importa o `telnetlib`, removido no 3.13, e o coletor morre no startup sem
++produzir métrica. Conserto:
++
++```sh
++python3 -m pip install -U 'netmiko>=4.4.0'
++```
++
++No SUSE, se o pip recusar com `externally-managed-environment`, use venv:
++
++```sh
++sudo python3 -m venv /opt/utm-venv
++sudo /opt/utm-venv/bin/pip install -U ucsmsdk 'netmiko>=4.4.0'
++```
++
++e troque `python3` por `/opt/utm-venv/bin/python` no `telegraf.conf` quando
++for promover.
++
++## Passo 1 — coleta automática
++
++```sh
++sudo ./tools/collect_validation.sh
++less /tmp/utm-validacao/relatorio.txt
++```
++
++O script descobre sozinho, a partir do `telegraf.conf`: o Python, o usuário do
++Telegraf, o modo de credencial, o arquivo de domínios ou o `creds.env`, e o
++dashboard. Qualquer um pode ser forçado por variável — ver o cabeçalho do
++script.
++
++O relatório tem, nesta ordem:
++
++| Seção | O que prova | Esperado |
++|---|---|---|
++| 0 | contexto: SO, Python, Telegraf, modo | — |
++| 1 | preflight com o Python e o usuário do Telegraf | OK |
++| 2 | integridade do pacote (`MANIFEST.sha256`) | confere |
++| 3 | testes contra o coletor **de produção** | **0/16** — os bugs estão ativos |
++| 4 | testes contra o coletor **novo** | **16/16** |
++| 5 | F1: senha em texto claro no `.pickle` | sem senha, idealmente |
++| 6 | F6: intervalo do Telegraf e do dashboard | 60 s e 60 s |
++| 7 | F6: stats collection policy do UCSM | igual ao 6 |
++| 8 | saída real antes × depois, em cópias isoladas | só `UTMCollectorHealth` a mais |
++| 9 | resumo | — |
++
++A seção 8 roda **cópias** dos dois coletores como o usuário do Telegraf, com
++instância própria (`validacao_antes`, `validacao_depois`), então não encosta no
++pickle nem no log de produção. Ela abre uma sessão por domínio no UCSM e faz
++logout no fim (`-dss`). Os logs que cria são listados no relatório e podem ser
++apagados.
++
++A seção 8 também passa as duas saídas pelo `tools/lp_lint.py`, que aponta
++linhas de Line Protocol que o Telegraf rejeitaria (achado F3) — por exemplo uma
++`location`/`GROUP` com espaço, como `DC São Paulo`.
++
++## Antes de enviar o relatório
++
++- IPs saem mascarados (`IP-1`, `IP-2`…) de forma consistente. `MASCARAR=0`
++  desliga.
++- **Nenhuma senha vai para o relatório**: a verificação do pickle compara bytes
++  e imprime só sim/não, e a leitura do `creds.env` nunca passa por linha de
++  comando.
++- Nomes de service profile e descrições de porta podem aparecer na seção 8
++  (séries antes/depois). Mascare o que não quiser expor — não atrapalha.
++
++## Se a seção 5 disser SIM
++
++A senha esteve legível em todo snapshot e backup da VM. Trate como
++comprometida:
++
++1. troque a senha do usuário de monitoração no UCSM;
++2. atualize `creds.env` (ou o `.txt`);
++3. `sudo systemctl stop telegraf && sudo shred -u /usr/local/telegraf/*.pickle && sudo systemctl start telegraf`.
++
++## Só depois do relatório analisado: promover
++
++Não promova antes. Quando for, o coletor certo é
++`coletor/modo-<file|env>/ucs_traffic_monitor.py` (o relatório diz qual), com
++backup do atual e o `patches/` como referência do que mudou.
+diff --git a/tests/test_quick_fixes.py b/tests/test_quick_fixes.py
+index 874b576..d557591 100644
+--- a/tests/test_quick_fixes.py
++++ b/tests/test_quick_fixes.py
+@@ -41,6 +41,14 @@ def _load_collector():
+             setattr(module, attr, object)
+         sys.modules[name] = module
+ 
++    if not COLLECTOR.is_file():
++        raise SystemExit(
++            "collector not found: {}\n"
++            "set UTM_COLLECTOR=/path/to/ucs_traffic_monitor.py".format(COLLECTOR))
++
++    # The env-mode collector does `import credentials`, which lives next to it
++    sys.path.insert(0, str(COLLECTOR.parent))
++
+     spec = importlib.util.spec_from_file_location("utm_under_test", COLLECTOR)
+     module = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(module)
+diff --git a/tools/audit_stats_interval.py b/tools/audit_stats_interval.py
+index 468ee7a..5209a5c 100755
+--- a/tools/audit_stats_interval.py
++++ b/tools/audit_stats_interval.py
+@@ -19,12 +19,14 @@ no error anywhere. This tool reports the three values side by side.
+ The stat types UTM actually reads are port (FI ports), adapter (vNIC/vHBA)
+ and chassis (backplane ports).
+ 
+-Usage:
+-    ./audit_stats_interval.py -i ucs_domains_group_1.txt \
+-                              -t /etc/telegraf/telegraf.conf \
+-                              -d ../grafana/dashboards/domain_traffic.json
++Usage (credentials from either mode, see credsource.py):
++    ./audit_stats_interval.py --env-file /etc/utm/creds.env        # env mode
++    ./audit_stats_interval.py -i ucs_domains_group_1.txt           # file mode
++    ./audit_stats_interval.py --no-ucs                              # offline
+ 
+-    ./audit_stats_interval.py -i ucs_domains_group_1.txt --no-ucs   # offline
++    -t adds telegraf config files or telegraf.d directories to inspect
++    (default: /etc/telegraf/telegraf.conf and /etc/telegraf/telegraf.d).
++    -d names a dashboard JSON to read [[polling_interval]] from.
+ 
+ Exits 0 when the intervals agree, 1 when they diverge, 2 on an error.
+ """
+@@ -33,11 +35,19 @@ Exits 0 when the intervals agree, 1 when they diverge, 2 on an error.
+ # no PEP 604 unions and no `from __future__ import annotations`.
+ import argparse
+ import json
++import os
+ import re
+ import sys
+ from pathlib import Path
+ from typing import Dict, List, Optional, Tuple
+ 
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import credsource  # noqa: E402
++
++# Telegraf's [agent] interval when telegraf.conf sets none
++TELEGRAF_DEFAULT_INTERVAL_S = 10
++DEFAULT_TELEGRAF_PATHS = ("/etc/telegraf/telegraf.conf", "/etc/telegraf/telegraf.d")
++
+ # Stat types whose deltas UTM exports. Others are collected by UCSM but
+ # unused here, so a mismatch on them does not skew any UTM panel.
+ STAT_TYPES_USED_BY_UTM = ("port", "adapter", "chassis")
+@@ -51,44 +61,70 @@ INTERVAL_SECONDS = {
+ }
+ 
+ 
+-def parse_domains(input_file):
+-    # type: (Path) -> List[Tuple[str, str, str]]
+-    """Read the UTM input file: IP,user,password per line, [Location] headers."""
+-    domains = []
+-    for raw_line in input_file.read_text().splitlines():
+-        line = raw_line.strip()
+-        if not line or line.startswith("#") or line.startswith("["):
+-            continue
+-        parts = line.split(",")
+-        if len(parts) < 3:
+-            print(f"  ! ignoring malformed line: {raw_line!r}", file=sys.stderr)
+-            continue
+-        domains.append((parts[0], parts[1], parts[2]))
+-    return domains
+-
+-
+-def telegraf_exec_interval(telegraf_conf):
+-    # type: (Path) -> Optional[int]
+-    """Pull the interval of the inputs.exec block that runs this collector."""
+-    try:
+-        text = telegraf_conf.read_text()
+-    except OSError as exc:
+-        print(f"  ! cannot read {telegraf_conf}: {exc}", file=sys.stderr)
++def parse_duration(raw):
++    # type: (str) -> Optional[int]
++    """Telegraf durations are Go durations ("10s", "1m", "1m30s") or bare
++    integer seconds. Returns whole seconds, or None when unparseable."""
++    raw = raw.strip().strip('"').strip()
++    if raw.isdigit():
++        return int(raw)
++    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", raw)
++    if not parts or "".join(n + u for n, u in parts) != raw:
+         return None
++    scale = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
++    return int(round(sum(float(n) * scale[u] for n, u in parts)))
+ 
+-    # Only look at inputs.exec blocks that actually invoke UTM
+-    blocks = re.split(r"^\s*\[\[", text, flags=re.MULTILINE)
+-    for block in blocks:
+-        if not block.startswith("inputs.exec"):
+-            continue
+-        if "ucs_traffic_monitor" not in block:
+-            continue
+-        match = re.search(r'^\s*interval\s*=\s*"(\d+)([smh])"',
+-                          block, flags=re.MULTILINE)
+-        if match:
+-            value, unit = int(match.group(1)), match.group(2)
+-            return value * {"s": 1, "m": 60, "h": 3600}[unit]
+-    return None
++
++def read_telegraf_config(paths):
++    # type: (List[Path]) -> str
++    """Concatenate telegraf.conf and every *.conf under telegraf.d."""
++    chunks = []
++    for path in paths:
++        files = sorted(path.glob("*.conf")) if path.is_dir() else [path]
++        for conf in files:
++            try:
++                chunks.append(conf.read_text())
++            except OSError as exc:
++                print(f"  ! cannot read {conf}: {exc}", file=sys.stderr)
++    return "\n".join(chunks)
++
++
++def _section_interval(block):
++    # type: (str) -> Optional[int]
++    match = re.search(r'^\s*interval\s*=\s*("?)([^"\n#]+)\1',
++                      block, flags=re.MULTILINE)
++    return parse_duration(match.group(2)) if match else None
++
++
++def telegraf_exec_interval(paths):
++    # type: (List[Path]) -> Tuple[Optional[int], str]
++    """Effective interval of the inputs.exec block that runs this collector.
++
++    An inputs.exec block without its own `interval` inherits [agent].interval,
++    which itself defaults to 10s. Reporting "not found" in that case would
++    hide exactly the mismatch this tool exists to catch.
++    """
++    text = read_telegraf_config(paths)
++    if not text:
++        return None, "telegraf config not readable"
++
++    # Split on every table header, keeping the header with its body
++    sections = re.split(r"^(?=\s*\[)", text, flags=re.MULTILINE)
++    utm_blocks = [b for b in sections
++                  if re.match(r"\s*\[\[\s*inputs\.exec\s*\]\]", b)
++                  and "ucs_traffic_monitor" in b]
++    if not utm_blocks:
++        return None, "no inputs.exec block runs ucs_traffic_monitor"
++
++    own = _section_interval(utm_blocks[0])
++    if own is not None:
++        return own, "set on the inputs.exec block"
++
++    agent = [b for b in sections if re.match(r"\s*\[\s*agent\s*\]", b)]
++    inherited = _section_interval(agent[0]) if agent else None
++    if inherited is not None:
++        return inherited, "inherited from [agent]"
++    return TELEGRAF_DEFAULT_INTERVAL_S, "Telegraf default, nothing set"
+ 
+ 
+ def dashboard_polling_interval(dashboard_json):
+@@ -195,51 +231,50 @@ def main():
+     parser = argparse.ArgumentParser(
+         description=__doc__,
+         formatter_class=argparse.RawDescriptionHelpFormatter)
+-    parser.add_argument("-i", "--input-file", type=Path, required=True,
+-                        help="UTM input file (ucs_domains_group_*.txt)")
+-    parser.add_argument("-t", "--telegraf-conf", type=Path,
+-                        default=Path("/etc/telegraf/telegraf.conf"),
+-                        help="telegraf.conf holding the inputs.exec block")
++    credsource.add_arguments(parser)
++    parser.add_argument("-t", "--telegraf-conf", type=Path, action="append",
++                        help="telegraf.conf or telegraf.d directory; repeatable "
++                             "(default: /etc/telegraf/telegraf.conf and "
++                             "/etc/telegraf/telegraf.d)")
+     parser.add_argument("-d", "--dashboard", type=Path,
+                         help="dashboard JSON carrying [[polling_interval]]")
+     parser.add_argument("--no-ucs", action="store_true",
+                         help="skip the UCS queries, report the local side only")
+     args = parser.parse_args()
+ 
+-    try:
+-        domains = parse_domains(args.input_file)
+-    except OSError as exc:
+-        print(f"cannot read {args.input_file}: {exc}", file=sys.stderr)
+-        return 2
+-
+-    if not domains:
+-        print(f"no domains in {args.input_file}", file=sys.stderr)
+-        return 2
+-
+-    telegraf_s = telegraf_exec_interval(args.telegraf_conf)
++    conf_paths = args.telegraf_conf or [
++        Path(p) for p in DEFAULT_TELEGRAF_PATHS if Path(p).exists()]
++    telegraf_s, telegraf_src = telegraf_exec_interval(conf_paths)
+     dashboard_s = (dashboard_polling_interval(args.dashboard)
+                    if args.dashboard else None)
+ 
+     print(f"telegraf inputs.exec interval : "
+-          f"{f'{telegraf_s}s' if telegraf_s else 'not found'}")
++          f"{f'{telegraf_s}s' if telegraf_s else 'not found'} ({telegraf_src})")
+     print(f"dashboard [[polling_interval]]: "
+-          f"{f'{dashboard_s}s' if dashboard_s else 'not checked'}")
++          f"{f'{dashboard_s}s' if dashboard_s else 'not checked (60s in the repo dashboards)'}")
+ 
+     if args.no_ucs:
+         print("\n--no-ucs: skipping the UCSM side. Run without it for the "
+               "verdict that matters.")
+         return 0
+ 
++    try:
++        domains = credsource.load(args)
++    except (credsource.CredentialError, OSError) as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 2
++
+     all_agreed = True
+-    for host, user, password in domains:
++    for domain in domains:
+         try:
+-            policies = ucsm_policy_intervals(host, user, password)
++            policies = ucsm_policy_intervals(domain.host, domain.user,
++                                             domain.password)
+         except Exception as exc:
+-            print(f"\n{host}\n  ! query failed: {type(exc).__name__}: {exc}",
++            print(f"\n{domain.host}\n  ! query failed: {type(exc).__name__}: {exc}",
+                   file=sys.stderr)
+             all_agreed = False
+             continue
+-        if not report_domain(host, policies, telegraf_s, dashboard_s):
++        if not report_domain(domain.host, policies, telegraf_s, dashboard_s):
+             all_agreed = False
+ 
+     if all_agreed:
+diff --git a/tools/check_pickle_exposure.py b/tools/check_pickle_exposure.py
+new file mode 100755
+index 0000000..0cbc665
+--- /dev/null
++++ b/tools/check_pickle_exposure.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/python3
++"""Report whether UTM session pickles carry UCS passwords, without printing them.
++
++The collector pickles UcsHandle objects between runs, and UcsSession keeps the
++password as an instance attribute, so the pickle can hold it in the clear
++(finding F1). A `strings | grep passw` check proves nothing: the attribute
++NAME `_UcsSession__password` is always there once a handle is pickled, and the
++grep puts the secret on the terminal. This tool instead looks for each
++configured password as raw bytes and prints only yes/no per domain.
++
++It never unpickles anything: pickle.load() would run code from the file
++(finding F2). It only reads bytes and stat().
++
++    tools/check_pickle_exposure.py --env-file /etc/utm/creds.env /usr/local/telegraf/*.pickle
++    tools/check_pickle_exposure.py -i ucs_domains_group_1.txt   /usr/local/telegraf/*.pickle
++
++Exits 0 when no password is found in any pickle, 1 when at least one is,
++2 on error.
++"""
++
++# Kept compatible with Python 3.6 so it runs on any host being diagnosed.
++from __future__ import print_function
++
++import argparse
++import os
++import stat
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import credsource  # noqa: E402
++
++# Present in the pickle whenever a UcsHandle (hence a UcsSession) was saved
++SESSION_MARKER = b"_UcsSession__password"
++
++
++def owner_name(uid):
++    try:
++        import pwd
++        return pwd.getpwuid(uid).pw_name
++    except (ImportError, KeyError):
++        return str(uid)
++
++
++def describe_mode(mode):
++    perms = stat.S_IMODE(mode)
++    notes = []
++    if perms & 0o044:
++        notes.append("readable by group/others")
++    if perms & 0o022:
++        notes.append("WRITABLE by group/others (pickle.load RCE risk)")
++    return "{:o}".format(perms), notes
++
++
++def check_file(path, domains):
++    """Return (exposed_count, lines) for one pickle file."""
++    lines = []
++    try:
++        st = os.stat(path)
++        with open(path, "rb") as handle:
++            blob = handle.read()
++    except (IOError, OSError) as exc:
++        return 0, ["  cannot read: {}".format(exc)]
++
++    mode, notes = describe_mode(st.st_mode)
++    lines.append("  mode {}  owner {}  size {} bytes".format(
++        mode, owner_name(st.st_uid), len(blob)))
++    for note in notes:
++        lines.append("  ! {}".format(note))
++
++    if SESSION_MARKER not in blob:
++        lines.append("  no UCS session stored (empty or cleared pickle)")
++        return 0, lines
++
++    exposed = 0
++    for domain in domains:
++        found = bool(domain.password) and \
++            domain.password.encode("utf-8") in blob
++        exposed += int(found)
++        lines.append("  {:<18} password in clear: {}".format(
++            domain.host, "YES" if found else "no"))
++    return exposed, lines
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    credsource.add_arguments(parser)
++    parser.add_argument("pickles", nargs="+", help="pickle files to inspect")
++    args = parser.parse_args()
++
++    try:
++        domains = credsource.load(args)
++    except (credsource.CredentialError, IOError, OSError) as exc:
++        print("error: {}".format(exc), file=sys.stderr)
++        return 2
++
++    total_exposed = 0
++    for path in args.pickles:
++        print(path)
++        exposed, lines = check_file(path, domains)
++        total_exposed += exposed
++        for line in lines:
++            print(line)
++
++    print("")
++    if total_exposed:
++        print("{} password(s) stored in clear. Treat them as compromised: "
++              "they were in every VM snapshot and backup. Rotate them on "
++              "UCSM, then shred the pickle files.".format(total_exposed))
++        return 1
++    print("No configured password found in the pickle files.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/collect_validation.sh b/tools/collect_validation.sh
+new file mode 100755
+index 0000000..3d83078
+--- /dev/null
++++ b/tools/collect_validation.sh
+@@ -0,0 +1,308 @@
++#!/usr/bin/env bash
++# Collect everything needed to validate the UTM quick fixes on this host,
++# in the right order, into one report to paste back for analysis.
++#
++#     sudo ./tools/collect_validation.sh
++#     less /tmp/utm-validacao/relatorio.txt
++#
++# Read-only for production: it never writes under UTM_DIR, never edits
++# telegraf.conf and never restarts a service. Everything it runs lands in OUT.
++# The before/after comparison runs copies of both collectors, as the telegraf
++# user, with their own instance name, so they cannot touch the production
++# pickle or log file.
++#
++# Works with both credential modes and detects which one production uses:
++#   file mode  upstream / master: ucs_domains_group_*.txt
++#   env  mode  feat/credentials-env-vars and later: /etc/utm/creds.env
++#
++# Everything is auto-detected from telegraf.conf; override when needed:
++#   UTM_DIR        where production ucs_traffic_monitor.py lives
++#   PY             interpreter telegraf runs the collector with
++#   TG_USER        user telegraf runs as
++#   CREDS_FILE     env mode credentials       (default /etc/utm/creds.env)
++#   GRP            file mode domains file     (default: from telegraf.conf)
++#   TELEGRAF_CONF  colon-separated configs/dirs (default telegraf.conf:telegraf.d)
++#   DASHBOARD      dashboard JSON with [[polling_interval]]
++#   OUT            output directory           (default /tmp/utm-validacao)
++#   MASCARAR=0     keep IP addresses in the report (masked by default)
++#   RUN_TIMEOUT    seconds per collector run  (default 180)
++
++set -u
++
++PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++UTM_DIR="${UTM_DIR:-/usr/local/telegraf}"
++CREDS_FILE="${CREDS_FILE:-/etc/utm/creds.env}"
++OUT="${OUT:-/tmp/utm-validacao}"
++MASCARAR="${MASCARAR:-1}"
++RUN_TIMEOUT="${RUN_TIMEOUT:-180}"
++TELEGRAF_PATHS=()
++IFS=: read -r -a _tg_candidates <<< "${TELEGRAF_CONF:-/etc/telegraf/telegraf.conf:/etc/telegraf/telegraf.d}"
++for candidate in "${_tg_candidates[@]}"; do
++    [ -e "$candidate" ] && TELEGRAF_PATHS+=("$candidate")
++done
++
++PROD_COLLECTOR="$UTM_DIR/ucs_traffic_monitor.py"
++REPORT="$OUT/relatorio.txt"
++
++die() { echo "erro: $*" >&2; exit 2; }
++
++[ "$(id -u)" -eq 0 ] || die "rode com sudo: precisa ler o pickle e rodar como o usuario do telegraf"
++[ -f "$PROD_COLLECTOR" ] || die "coletor de producao nao encontrado em $PROD_COLLECTOR (ajuste UTM_DIR)"
++[ -d "$PKG_DIR/coletor" ] || die "rode a partir do pacote utm-validacao (falta $PKG_DIR/coletor)"
++
++# --- detection ---------------------------------------------------------------
++
++if grep -q '^import credentials' "$PROD_COLLECTOR"; then
++    MODE="env"
++else
++    MODE="file"
++fi
++
++# The command telegraf actually runs, from the inputs.exec block
++EXEC_LINES=""
++if [ "${#TELEGRAF_PATHS[@]}" -gt 0 ]; then
++    EXEC_LINES="$(grep -rhoE '"[^"]*ucs_traffic_monitor\.py[^"]*"' "${TELEGRAF_PATHS[@]}" 2>/dev/null | tr -d '"')"
++fi
++EXEC_COUNT="$(printf '%s\n' "$EXEC_LINES" | grep -c . || true)"
++EXEC_CMD="$(printf '%s\n' "$EXEC_LINES" | head -n1)"
++
++if [ -z "${PY:-}" ]; then
++    PY="$(printf '%s' "$EXEC_CMD" | awk '{print $1}')"
++    [ -n "$PY" ] || PY=python3
++fi
++PY="$(command -v "$PY" || echo "$PY")"
++
++if [ -z "${GRP:-}" ] && [ "$MODE" = file ]; then
++    GRP="$(printf '%s' "$EXEC_CMD" | awk '{for (i = 1; i < NF; i++) if ($i ~ /ucs_traffic_monitor\.py$/) {print $(i + 1); exit}}')"
++fi
++
++if [ -z "${TG_USER:-}" ]; then
++    TG_USER="$(systemctl show -p User --value telegraf 2>/dev/null || true)"
++    if [ -z "$TG_USER" ]; then
++        if id telegraf >/dev/null 2>&1; then TG_USER=telegraf; else TG_USER=root; fi
++    fi
++fi
++id "$TG_USER" >/dev/null 2>&1 || die "usuario '$TG_USER' nao existe (ajuste TG_USER)"
++
++if [ -z "${DASHBOARD:-}" ]; then
++    for candidate in /var/lib/grafana/dashboards/domain_traffic.json \
++                     "$PKG_DIR/grafana/dashboards/domain_traffic.json"; do
++        if [ -f "$candidate" ]; then DASHBOARD="$candidate"; break; fi
++    done
++fi
++
++if [ "$MODE" = env ]; then
++    CRED_ARGS=(--env-file "$CREDS_FILE")
++else
++    CRED_ARGS=(-i "${GRP:-}")
++fi
++
++# --- helpers -----------------------------------------------------------------
++
++# Prefix that runs a command as the telegraf user. An array rather than a
++# function, because `timeout` can only exec real programs.
++if [ "$TG_USER" = root ]; then
++    RUNAS=(env)
++elif command -v runuser >/dev/null 2>&1; then
++    RUNAS=(runuser -u "$TG_USER" --)
++else
++    RUNAS=(sudo -u "$TG_USER" --)
++fi
++
++as_tg() { "${RUNAS[@]}" "$@"; }
++
++section() { printf '\n===== %s =====\n' "$*"; }
++
++series_keys() { awk 'NF {print $1}' "$1" | sort -u; }
++
++measurements() { awk -F'[, ]' 'NF {print $1}' "$1" | sort | uniq -c | awk '{printf "%-26s %s\n", $2, $1}'; }
++
++# --- staging: a copy of the package the telegraf user can read ---------------
++
++case "$(basename "$OUT")" in
++    *utm*) ;;
++    *) die "OUT precisa ter 'utm' no nome (proteção do rm -rf): $OUT" ;;
++esac
++rm -rf "$OUT"
++install -d -m 0750 -o "$TG_USER" "$OUT"
++STAGE="$OUT/pkg"
++mkdir -p "$STAGE"
++cp -r "$PKG_DIR/tools" "$PKG_DIR/tests" "$PKG_DIR/coletor" "$STAGE/"
++chown -R "$TG_USER" "$STAGE"
++NEW_COLLECTOR="$STAGE/coletor/modo-$MODE/ucs_traffic_monitor.py"
++[ -f "$NEW_COLLECTOR" ] || die "variante modo-$MODE ausente no pacote"
++
++PREFLIGHT_RC=1
++PROD_TESTS="?"
++NEW_TESTS="?"
++PICKLE_RC="?"
++AUDIT_RC="?"
++
++{
++section "0. contexto"
++echo "data            : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++# shellcheck source=/dev/null
++echo "sistema         : $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
++echo "python          : $PY ($("$PY" --version 2>&1))"
++echo "telegraf        : $(telegraf --version 2>/dev/null | head -n1)"
++echo "usuario telegraf: $TG_USER"
++echo "modo credencial : $MODE"
++echo "coletor produção: $PROD_COLLECTOR"
++echo "blocos exec UTM : $EXEC_COUNT"
++if [ "$MODE" = env ]; then
++    echo "comando telegraf: $EXEC_CMD"
++    echo "creds.env       : $(stat -c '%a %U:%G' "$CREDS_FILE" 2>&1)"
++else
++    echo "comando telegraf: $EXEC_CMD"
++    echo "arquivo domínios: ${GRP:-não encontrado} ($(stat -c '%a %U:%G' "${GRP:-/nonexistent}" 2>&1))"
++fi
++[ "$EXEC_COUNT" -gt 1 ] && echo "aviso           : mais de um bloco exec do UTM; validando o primeiro"
++
++section "1. preflight (como $TG_USER, com o python do telegraf)"
++as_tg env UTM_COLLECTOR="$NEW_COLLECTOR" "$PY" "$STAGE/tools/preflight.py"
++PREFLIGHT_RC=$?
++
++section "2. integridade do pacote"
++if [ -f "$PKG_DIR/MANIFEST.sha256" ]; then
++    (cd "$PKG_DIR" && sha256sum -c --quiet MANIFEST.sha256 && echo "todos os arquivos conferem")
++else
++    echo "sem MANIFEST.sha256 (rodando fora do pacote?)"
++fi
++
++section "3. testes contra o coletor de PRODUÇÃO (esperado: 0/16)"
++env UTM_COLLECTOR="$PROD_COLLECTOR" "$PY" "$STAGE/tests/test_quick_fixes.py" \
++    > "$OUT/tests_producao.txt" 2>&1
++grep -E '^(ok|FAIL) |^ {8}[A-Za-z]+(Error|Exception)' "$OUT/tests_producao.txt"
++PROD_TESTS="$(tail -n1 "$OUT/tests_producao.txt")"
++echo "$PROD_TESTS"
++
++section "4. testes contra o coletor NOVO (esperado: 16/16)"
++env UTM_COLLECTOR="$NEW_COLLECTOR" "$PY" "$STAGE/tests/test_quick_fixes.py" \
++    > "$OUT/tests_novo.txt" 2>&1
++grep -E '^FAIL ' "$OUT/tests_novo.txt"
++NEW_TESTS="$(tail -n1 "$OUT/tests_novo.txt")"
++echo "$NEW_TESTS"
++
++section "5. F1 — senha em texto claro no .pickle?"
++shopt -s nullglob
++PICKLES=("$UTM_DIR"/*.pickle)
++shopt -u nullglob
++if [ "${#PICKLES[@]}" -eq 0 ]; then
++    echo "nenhum .pickle em $UTM_DIR"
++    PICKLE_RC=0
++else
++    as_tg "$PY" "$STAGE/tools/check_pickle_exposure.py" "${CRED_ARGS[@]}" "${PICKLES[@]}"
++    PICKLE_RC=$?
++fi
++
++section "6. F6 — intervalos, lado local"
++TG_ARGS=()
++for path in ${TELEGRAF_PATHS[@]+"${TELEGRAF_PATHS[@]}"}; do TG_ARGS+=(-t "$path"); done
++DASH_ARGS=()
++[ -n "${DASHBOARD:-}" ] && DASH_ARGS=(-d "$DASHBOARD")
++"$PY" "$STAGE/tools/audit_stats_interval.py" --no-ucs ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
++
++section "7. F6 — intervalos, lado UCSM"
++as_tg "$PY" "$STAGE/tools/audit_stats_interval.py" "${CRED_ARGS[@]}" ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
++AUDIT_RC=$?
++echo "exit=$AUDIT_RC  (0 = batem, 1 = divergem, 2 = erro)"
++
++section "8. saída antes x depois (cópias isoladas, como $TG_USER)"
++if [ "$PREFLIGHT_RC" -ne 0 ]; then
++    echo "pulado: o preflight falhou, o coletor não roda neste host como está."
++else
++    RUN="$OUT/run"
++    for side in antes depois; do mkdir -p "$RUN/$side"; done
++    cp "$PROD_COLLECTOR" "$RUN/antes/ucs_traffic_monitor.py"
++    cp "$NEW_COLLECTOR" "$RUN/depois/ucs_traffic_monitor.py"
++    if [ "$MODE" = env ]; then
++        cp "$UTM_DIR/credentials.py" "$RUN/antes/"
++        cp "$STAGE/coletor/modo-env/credentials.py" "$RUN/depois/"
++    else
++        install -m 0600 -o "$TG_USER" "$GRP" "$RUN/validacao_grp.txt"
++    fi
++    chown -R "$TG_USER" "$RUN"
++
++    for side in antes depois; do
++        collector="$RUN/$side/ucs_traffic_monitor.py"
++        if [ "$MODE" = env ]; then
++            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" \
++                "$PY" "$STAGE/tools/credsource.py" exec "$CREDS_FILE" -- \
++                "$PY" "$collector" influxdb-lp --instance-name "validacao_$side" -dss \
++                > "$RUN/$side.lp" 2> "$RUN/$side.err"
++        else
++            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" "$PY" "$collector" "$RUN/validacao_grp.txt" \
++                influxdb-lp -dss > "$RUN/$side.lp" 2> "$RUN/$side.err"
++        fi
++        echo "$side: exit=$? linhas=$(grep -c . "$RUN/$side.lp")"
++    done
++
++    echo
++    echo "--- linhas por medição (antes | depois) ---"
++    join -a1 -a2 -e 0 -o 0,1.2,2.2 \
++        <(measurements "$RUN/antes.lp" | sort) <(measurements "$RUN/depois.lp" | sort) \
++        | awk '{printf "  %-26s %6s | %s\n", $1, $2, $3}'
++
++    echo
++    echo "--- séries só no depois (primeiras 10) ---"
++    comm -13 <(series_keys "$RUN/antes.lp") <(series_keys "$RUN/depois.lp") | head -n 10
++    echo "--- séries só no antes (primeiras 10) ---"
++    comm -23 <(series_keys "$RUN/antes.lp") <(series_keys "$RUN/depois.lp") | head -n 10
++
++    echo
++    echo "--- F3: linhas malformadas (antes) ---"
++    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/antes.lp"
++    echo "--- F3: linhas malformadas (depois) ---"
++    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/depois.lp"
++
++    echo
++    echo "--- F4: saúde da coleta (depois) ---"
++    grep '^UTMCollectorHealth' "$RUN/depois.lp" || echo "nenhuma linha UTMCollectorHealth"
++
++    echo
++    echo "--- logs criados pelas execuções de validação (pode apagar) ---"
++    ls -1 /var/log/telegraf/ucs_traffic_monitor/*validacao* 2>/dev/null || echo "  nenhum"
++
++    for side in antes depois; do
++        if [ -s "$RUN/$side.err" ]; then
++            echo
++            echo "--- stderr $side (últimas 8 linhas) ---"
++            tail -n 8 "$RUN/$side.err"
++        fi
++    done
++fi
++
++section "9. resumo"
++printf '  %-34s %s\n' \
++    "preflight"                        "$([ "$PREFLIGHT_RC" -eq 0 ] && echo OK || echo FALHOU)" \
++    "testes x produção (esperado 0/16)" "$PROD_TESTS" \
++    "testes x novo     (esperado 16/16)" "$NEW_TESTS" \
++    "senha em claro no pickle"          "$(case "$PICKLE_RC" in 1) echo SIM;; 0) echo não;; *) echo "erro ($PICKLE_RC)";; esac)" \
++    "intervalos UCSM/telegraf/dash"     "$(case "$AUDIT_RC" in 0) echo batem;; 1) echo DIVERGEM;; *) echo "erro ($AUDIT_RC)";; esac)"
++} > "$REPORT.raw" 2>&1
++
++# IP addresses become IP-1, IP-2... consistently, so the analysis still works
++if [ "$MASCARAR" = 1 ]; then
++    "$PY" - "$REPORT.raw" > "$REPORT" <<'PY'
++import re
++import sys
++
++seen = {}
++
++def mask(match):
++    ip = match.group(0)
++    if ip not in seen:
++        seen[ip] = "IP-{}".format(len(seen) + 1)
++    return seen[ip]
++
++with open(sys.argv[1]) as handle:
++    sys.stdout.write(re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", mask, handle.read()))
++PY
++else
++    cp "$REPORT.raw" "$REPORT"
++fi
++rm -f "$REPORT.raw"
++chmod 0640 "$REPORT"
++
++echo "relatório: $REPORT"
++echo "revise antes de enviar (MASCARAR=$MASCARAR)."
+diff --git a/tools/credsource.py b/tools/credsource.py
+new file mode 100755
+index 0000000..6df33be
+--- /dev/null
++++ b/tools/credsource.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/python3
++"""Load UCS domain credentials from either configuration mode UTM supports.
++
++UTM has two credential modes in the wild:
++
++  file mode  upstream / master: a text file with `IP,user,password` lines and
++             `[Location]` headers, passed as the first positional argument.
++  env mode   feat/credentials-env-vars and later: UTM_DOMAINS=dom1,dom2 plus
++             UTM_<id>_HOST / _USER / _PASS / _GROUP, delivered by systemd from
++             an EnvironmentFile such as /etc/utm/creds.env.
++
++The validation tools accept either source through the same three options
++(`-i FILE`, `--env-file FILE`, `--from-env`), so they run unchanged against
++whichever collector is in production.
++
++Run as a command, this module also launches a program with an env file loaded
++the way the collector would see it under systemd, without the secrets ever
++appearing on a command line:
++
++    python3 credsource.py exec /etc/utm/creds.env -- python3 collector.py ...
++"""
++
++# Kept compatible with Python 3.6 so it runs on any host being diagnosed.
++from __future__ import print_function
++
++import os
++import shlex
++import sys
++from collections import namedtuple
++
++Domain = namedtuple("Domain", "id host user password group")
++
++
++class CredentialError(Exception):
++    """Raised when no usable credential source was found."""
++
++
++def parse_env_file(path):
++    """Parse a systemd EnvironmentFile / dotenv-style file into a dict.
++
++    Handles blank lines, `#` comments, an optional `export ` prefix, and POSIX
++    shell quoting, including the `'\\''` escape that migrate_credentials.py
++    writes for passwords containing single quotes.
++    """
++    env = {}
++    with open(path) as handle:
++        for lineno, raw in enumerate(handle, 1):
++            line = raw.strip()
++            if not line or line.startswith("#"):
++                continue
++            if line.startswith("export "):
++                line = line[len("export "):].lstrip()
++            if "=" not in line:
++                raise CredentialError(
++                    "{}:{}: not a KEY=VALUE line".format(path, lineno))
++            key, _, value = line.partition("=")
++            key = key.strip()
++            try:
++                parts = shlex.split(value, posix=True)
++            except ValueError as exc:
++                raise CredentialError(
++                    "{}:{}: cannot parse value for {}: {}".format(
++                        path, lineno, key, exc))
++            env[key] = " ".join(parts) if parts else ""
++    return env
++
++
++def domains_from_env(env):
++    """Env mode: UTM_DOMAINS plus UTM_<id>_HOST/USER/PASS/GROUP."""
++    ids = [item.strip() for item in env.get("UTM_DOMAINS", "").split(",")
++           if item.strip()]
++    if not ids:
++        raise CredentialError("UTM_DOMAINS is empty or unset")
++
++    domains = []
++    for domain_id in ids:
++        values = {}
++        for field in ("HOST", "USER", "PASS"):
++            key = "UTM_{}_{}".format(domain_id, field)
++            if not env.get(key):
++                raise CredentialError("missing {}".format(key))
++            values[field] = env[key]
++        domains.append(Domain(domain_id, values["HOST"], values["USER"],
++                              values["PASS"],
++                              env.get("UTM_{}_GROUP".format(domain_id),
++                                      "default")))
++    return domains
++
++
++def domains_from_file(path):
++    """File mode: mirrors get_ucs_domains() in the upstream collector,
++    including taking the third comma-separated field as the password."""
++    domains = []
++    location = ""
++    with open(path) as handle:
++        for raw in handle:
++            if raw.startswith("#"):
++                continue
++            line = raw.strip()
++            if not line:
++                continue
++            if line.startswith("["):
++                location = line.strip("[]").strip()
++                continue
++            parts = line.split(",")
++            if len(parts) < 3:
++                continue
++            domains.append(Domain(parts[0], parts[0], parts[1], parts[2],
++                                  location))
++    if not domains:
++        raise CredentialError("no domains in {}".format(path))
++    return domains
++
++
++def add_arguments(parser):
++    """Register the three credential-source options on an argparse parser."""
++    group = parser.add_mutually_exclusive_group()
++    group.add_argument("-i", "--input-file",
++                       help="file mode: ucs_domains_group_*.txt")
++    group.add_argument("--env-file",
++                       help="env mode: EnvironmentFile, e.g. /etc/utm/creds.env")
++    group.add_argument("--from-env", action="store_true",
++                       help="env mode: read UTM_* from this process environment")
++
++
++def load(args):
++    """Return the domains from whichever source the parsed args selected."""
++    if getattr(args, "input_file", None):
++        return domains_from_file(args.input_file)
++    if getattr(args, "env_file", None):
++        return domains_from_env(parse_env_file(args.env_file))
++    if getattr(args, "from_env", False):
++        return domains_from_env(os.environ)
++    raise CredentialError(
++        "no credential source: pass -i FILE, --env-file FILE or --from-env")
++
++
++def _exec_with_env_file(argv):
++    """`exec ENVFILE -- cmd args...`: replace this process with cmd, run with
++    ENVFILE merged into the environment."""
++    if len(argv) < 3 or argv[1] != "--":
++        print("usage: credsource.py exec ENVFILE -- command [args...]",
++              file=sys.stderr)
++        return 2
++    env = dict(os.environ)
++    env.update(parse_env_file(argv[0]))
++    command = argv[2:]
++    os.execvpe(command[0], command, env)
++    return 0  # not reached
++
++
++if __name__ == "__main__":
++    if len(sys.argv) > 1 and sys.argv[1] == "exec":
++        try:
++            sys.exit(_exec_with_env_file(sys.argv[2:]))
++        except CredentialError as exc:
++            print("credsource: {}".format(exc), file=sys.stderr)
++            sys.exit(2)
++    print(__doc__)
++    sys.exit(0)
+diff --git a/tools/lp_lint.py b/tools/lp_lint.py
+new file mode 100755
+index 0000000..3ed3e0b
+--- /dev/null
++++ b/tools/lp_lint.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/python3
++"""Check InfluxDB Line Protocol output for malformed lines.
++
++The collector builds Line Protocol by string concatenation with no escaping
++(finding F3). A location or GROUP with a space ("DC Sao Paulo"), or a port
++description with a double quote, produces a line that Telegraf rejects: the
++series silently disappears from the dashboards. This tool parses each line
++the way the InfluxDB parser does and reports which ones would be rejected.
++
++It prints the measurement name, line number and the reason, never the tag or
++field values, so the report is safe to share.
++
++    python3 ucs_traffic_monitor.py ... influxdb-lp | tools/lp_lint.py
++    tools/lp_lint.py saida.lp
++
++Exits 0 when every line parses, 1 when at least one is malformed.
++"""
++
++# Kept compatible with Python 3.6 so it runs on any host being diagnosed.
++from __future__ import print_function
++
++import re
++import sys
++from collections import Counter
++
++_NUMBER = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
++_INTEGER = re.compile(r"^[+-]?\d+[iu]$")
++_BOOLEAN = {"t", "T", "true", "True", "TRUE", "f", "F", "false", "False", "FALSE"}
++
++
++def split_unescaped(text, separator, honor_quotes):
++    """Split on `separator` outside backslash escapes (and quotes, if asked).
++
++    Returns (parts, error) where error is set for an unterminated quote.
++    """
++    parts, current = [], []
++    in_quotes = escaped = False
++    for ch in text:
++        if escaped:
++            current.append(ch)
++            escaped = False
++            continue
++        if ch == "\\":
++            current.append(ch)
++            escaped = True
++            continue
++        if honor_quotes and ch == '"':
++            in_quotes = not in_quotes
++            current.append(ch)
++            continue
++        if ch == separator and not in_quotes:
++            parts.append("".join(current))
++            current = []
++            continue
++        current.append(ch)
++    parts.append("".join(current))
++    return parts, ("unterminated string value" if in_quotes else None)
++
++
++def check_field_value(value):
++    if value.startswith('"'):
++        if len(value) < 2 or not value.endswith('"'):
++            return "string field not properly quoted"
++        escaped = False
++        for ch in value[1:-1]:
++            if escaped:
++                escaped = False
++            elif ch == "\\":
++                escaped = True
++            elif ch == '"':
++                # e.g. a port description containing a double quote
++                return "unescaped double quote inside string field"
++        return None
++    if _NUMBER.match(value) or _INTEGER.match(value) or value in _BOOLEAN:
++        return None
++    return "field value is not a number, bool or quoted string"
++
++
++def check_line(line):
++    """Return (measurement, reason) for a malformed line, or None when valid."""
++    sections, err = split_unescaped(line, " ", honor_quotes=True)
++    measurement = (split_unescaped(sections[0], ",", False)[0][0] or "?")[:30]
++    if err:
++        return measurement, err
++    sections = [s for s in sections if s != ""]
++    if len(sections) < 2:
++        return measurement, "no field set"
++    if len(sections) > 3:
++        return measurement, "unescaped space in a tag or field key"
++
++    series, fields = sections[0], sections[1]
++    tags = split_unescaped(series, ",", honor_quotes=False)[0][1:]
++    for tag in tags:
++        pair = split_unescaped(tag, "=", honor_quotes=False)[0]
++        if len(pair) != 2 or not pair[0] or not pair[1]:
++            return measurement, "malformed or empty tag"
++
++    field_items, err = split_unescaped(fields, ",", honor_quotes=True)
++    if err:
++        return measurement, err
++    for item in field_items:
++        key, sep, value = item.partition("=")
++        if not sep or not key or not value:
++            return measurement, "malformed field (missing key or value)"
++        problem = check_field_value(value)
++        if problem:
++            return measurement, problem
++
++    if len(sections) == 3 and not sections[2].lstrip("-").isdigit():
++        return measurement, "timestamp is not an integer"
++    return None
++
++
++def main(argv):
++    stream = open(argv[1]) if len(argv) > 1 else sys.stdin
++    total = 0
++    bad = []
++    per_measurement = Counter()
++    for lineno, raw in enumerate(stream, 1):
++        line = raw.rstrip("\n")
++        if not line.strip():
++            continue
++        total += 1
++        problem = check_line(line)
++        if problem:
++            bad.append((lineno,) + problem)
++            per_measurement[problem[0]] += 1
++
++    print("lines checked: {}   malformed: {}".format(total, len(bad)))
++    for measurement, count in per_measurement.most_common():
++        print("  {:<24} {} malformed".format(measurement, count))
++    for lineno, measurement, reason in bad[:15]:
++        print("  line {:>5}  {:<24} {}".format(lineno, measurement, reason))
++    if len(bad) > 15:
++        print("  ... {} more".format(len(bad) - 15))
++    return 1 if bad else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+diff --git a/tools/preflight.py b/tools/preflight.py
+index 66bee50..db119df 100755
+--- a/tools/preflight.py
++++ b/tools/preflight.py
+@@ -75,19 +75,47 @@ def check_netmiko():
+     return True, raw
+ 
+ 
++def find_collector():
++    """UTM_COLLECTOR, else the repo layout, else the package layouts."""
++    explicit = os.environ.get("UTM_COLLECTOR")
++    if explicit:
++        return explicit
++    here = os.path.dirname(os.path.abspath(__file__))
++    root = os.path.dirname(here)
++    for candidate in (os.path.join(root, "telegraf", "ucs_traffic_monitor.py"),
++                      os.path.join(root, "ucs_traffic_monitor.py")):
++        if os.path.exists(candidate):
++            return candidate
++    return None
++
++
++def collector_mode(path):
++    with open(path) as handle:
++        source = handle.read()
++    return "env" if "import credentials" in source else "file"
++
++
+ def check_collector_syntax():
+     import ast
+ 
+-    here = os.path.dirname(os.path.abspath(__file__))
+-    path = os.path.join(os.path.dirname(here), "telegraf", "ucs_traffic_monitor.py")
+-    if not os.path.exists(path):
+-        path = os.path.join(here, "ucs_traffic_monitor.py")
+-    if not os.path.exists(path):
+-        return False, "ucs_traffic_monitor.py not found next to tools/"
+-
++    path = find_collector()
++    if not path or not os.path.exists(path):
++        return False, "collector not found; set UTM_COLLECTOR=/path/to/it"
+     with open(path) as handle:
+         ast.parse(handle.read(), filename=path)
+-    return True, path
++    return True, "{} ({} mode)".format(path, collector_mode(path))
++
++
++def check_credentials_module():
++    """Env mode only: credentials.py must sit next to the collector."""
++    path = find_collector()
++    if not path or collector_mode(path) != "env":
++        return True, "not needed (file mode)"
++    if sys.version_info < (3, 7):
++        return False, "env mode needs Python 3.7+ (project declares 3.10+)"
++    sys.path.insert(0, os.path.dirname(path))
++    import credentials                                        # noqa: F401
++    return True, os.path.join(os.path.dirname(path), "credentials.py")
+ 
+ 
+ def main():
+@@ -98,6 +126,7 @@ def main():
+         check("ucsmsdk", check_ucsmsdk),
+         check("netmiko", check_netmiko),
+         check("collector syntax", check_collector_syntax),
++        check("credentials module", check_credentials_module),
+     ]
+     print("-" * 60)
+ 
+-- 
+2.43.0
+
+
+From aea563da503866d74ad9065a011d62c0c765a607 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 09:24:57 +0000
+Subject: [PATCH 5/7] Disable setuptools package discovery so the CI install
+ step works
+
+`pip install -e .[dev]`, the CI's install step, aborts with "Multiple
+top-level packages discovered in a flat-layout" on lib/, deploy/, grafana/
+and friends. This predates the quick fixes: the branch fails the same way
+without them. The CI only triggers on pushes to main/master and on pull
+requests, which is likely why it never surfaced here.
+
+The repo is a set of scripts, not an importable package, so declaring no
+modules is the accurate fix. The install then only pulls the dependencies.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+---
+ pyproject.toml | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 44c2d99..c266b90 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -14,6 +14,12 @@ dev = [
+     "ruff>=0.6",
+ ]
+ 
++# This repo is a collection of scripts, not an importable package. Without
++# this, setuptools' flat-layout discovery aborts `pip install -e .[dev]` on the
++# lib/, deploy/, grafana/... directories, and the CI install step fails.
++[tool.setuptools]
++py-modules = []
++
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ python_files = ["test_*.py"]
+-- 
+2.43.0
+
+
+From 0af85a1e37b33fe92bf37cfea6557440b367bf64 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 09:24:58 +0000
+Subject: [PATCH 6/7] Require netmiko 4.4+ and match the branch's lint rules
+
+- pyproject.toml: netmiko>=4.0 becomes >=4.4.0. Below 4.4, netmiko imports
+  the stdlib telnetlib, which Python 3.13 removed, so the collector dies at
+  import on a current host. Checked on 3.13: 4.0.0, 4.2.0 and 4.3.0 fail,
+  4.4.0 and 4.8.0 work. The CI matrix stops at 3.12, so it cannot catch it.
+- tests/test_quick_fixes.py: ruff --fix and ruff format for the py310 target
+  and rule set this branch declares. No behavior change; 16/16 still pass.
+
+Full CI of this branch passes: install, ruff check/format, pytest (23 passed
+on 3.10, 3.12 and 3.13), shellcheck, bats (13/13).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+---
+ pyproject.toml            |   2 +-
+ tests/test_quick_fixes.py | 125 ++++++++++++++++++++++++--------------
+ 2 files changed, 82 insertions(+), 45 deletions(-)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index c266b90..79600ea 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -5,7 +5,7 @@ description = "Cisco UCS metrics collector for Telegraf/InfluxDB/Grafana"
+ requires-python = ">=3.10"
+ dependencies = [
+     "ucsmsdk",
+-    "netmiko>=4.0",
++    "netmiko>=4.4.0",  # <4.4 imports stdlib telnetlib, removed in Python 3.13
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/tests/test_quick_fixes.py b/tests/test_quick_fixes.py
+index d557591..21d44a6 100644
+--- a/tests/test_quick_fixes.py
++++ b/tests/test_quick_fixes.py
+@@ -10,7 +10,7 @@ Runs standalone or under pytest:
+     pytest tests/test_quick_fixes.py
+ """
+ 
+-# Kept compatible with Python 3.6, the CentOS 7 UTM VM's interpreter.
++# Targets the Python 3.10+ this branch declares in pyproject.toml.
+ import importlib.util
+ import io
+ import os
+@@ -25,15 +25,16 @@ from pathlib import Path
+ REPO_ROOT = Path(__file__).resolve().parent.parent
+ # UTM_COLLECTOR points the suite at another copy of the collector, which is
+ # how these tests are checked against the pre-fix code: they must fail there.
+-COLLECTOR = Path(os.environ.get(
+-    "UTM_COLLECTOR", REPO_ROOT / "telegraf" / "ucs_traffic_monitor.py"))
++COLLECTOR = Path(os.environ.get("UTM_COLLECTOR", REPO_ROOT / "telegraf" / "ucs_traffic_monitor.py"))
+ 
+ 
+ def _load_collector():
+     """Import the collector with its UCS dependencies stubbed out."""
+-    for name, attr in (("ucsmsdk", None),
+-                       ("ucsmsdk.ucshandle", "UcsHandle"),
+-                       ("netmiko", "ConnectHandler")):
++    for name, attr in (
++        ("ucsmsdk", None),
++        ("ucsmsdk.ucshandle", "UcsHandle"),
++        ("netmiko", "ConnectHandler"),
++    ):
+         if name in sys.modules:
+             continue
+         module = types.ModuleType(name)
+@@ -43,8 +44,8 @@ def _load_collector():
+ 
+     if not COLLECTOR.is_file():
+         raise SystemExit(
+-            "collector not found: {}\n"
+-            "set UTM_COLLECTOR=/path/to/ucs_traffic_monitor.py".format(COLLECTOR))
++            f"collector not found: {COLLECTOR}\nset UTM_COLLECTOR=/path/to/ucs_traffic_monitor.py"
++        )
+ 
+     # The env-mode collector does `import credentials`, which lives next to it
+     sys.path.insert(0, str(COLLECTOR.parent))
+@@ -60,8 +61,14 @@ utm = _load_collector()
+ 
+ def _reset_state():
+     """Clear the collector's module-level state between tests."""
+-    for name in ("stats_dict", "domain_dict", "conn_dict",
+-                 "raw_sdk_stats", "raw_cli_stats", "pickled_connections"):
++    for name in (
++        "stats_dict",
++        "domain_dict",
++        "conn_dict",
++        "raw_sdk_stats",
++        "raw_cli_stats",
++        "pickled_connections",
++    ):
+         getattr(utm, name).clear()
+     utm.user_args.clear()
+ 
+@@ -69,39 +76,66 @@ def _reset_state():
+ def _minimal_domain(fex_peer_type="S-rack", with_rack_unit=False):
+     """Smallest stats_dict that reaches the FEX backplane branch of the output."""
+     fi = {
+-        "load": "1", "total_memory": "1", "mem_available": "1",
+-        "model": "UCS-FI-6454", "serial": "SAL0000", "oob_if_ip": "10.0.0.2",
+-        "fi_fw_sys_ver": "4.2(3d)", "ha_ready": "yes", "leadership": "primary",
++        "load": "1",
++        "total_memory": "1",
++        "mem_available": "1",
++        "model": "UCS-FI-6454",
++        "serial": "SAL0000",
++        "oob_if_ip": "10.0.0.2",
++        "fi_fw_sys_ver": "4.2(3d)",
++        "ha_ready": "yes",
++        "leadership": "primary",
+         "fi_ports": {},
+     }
+     domain = {
+-        "location": "DC1", "mode": "cluster", "name": "utm-lab", "uptime": 1,
++        "location": "DC1",
++        "mode": "cluster",
++        "name": "utm-lab",
++        "uptime": 1,
+         "ucsm_fw_ver": "4.2(3d)",
+-        "A": dict(fi), "B": dict(fi),
+-        "chassis": {}, "ru": {}, "fex": {
+-            "fex-3": {"bp_ports": {"1": {"01": {
+-                "fi_id": "A",
+-                "peer_type": fex_peer_type,
+-                "peer": "rack-unit-5",
+-                "peer_port": "1/1",
+-                "oper_state": "up",
+-                "oper_speed": 40,
+-            }}}}
++        "A": dict(fi),
++        "B": dict(fi),
++        "chassis": {},
++        "ru": {},
++        "fex": {
++            "fex-3": {
++                "bp_ports": {
++                    "1": {
++                        "01": {
++                            "fi_id": "A",
++                            "peer_type": fex_peer_type,
++                            "peer": "rack-unit-5",
++                            "peer_port": "1/1",
++                            "oper_state": "up",
++                            "oper_speed": 40,
++                        }
++                    }
++                }
++            }
+         },
+     }
+     if with_rack_unit:
+         # Full key set, because the rack unit loop runs before the FEX loop
+         # and feeds influxdb_lp_server_fields()
+-        domain["ru"] = {"rack-unit-5": {
+-            "service_profile": "SP-ESX-05",
+-            "admin_state": "in-service", "association": "associated",
+-            "operability": "operable", "oper_state": "ok",
+-            "oper_state_code": 0, "memory": "262144",
+-            "model": "UCSC-C220-M5SX", "num_adaptors": "1",
+-            "num_cores": "32", "num_cpus": "2",
+-            "num_vEths": "2", "num_vFCs": "2", "serial": "WZP0000",
+-            "adaptors": {},
+-        }}
++        domain["ru"] = {
++            "rack-unit-5": {
++                "service_profile": "SP-ESX-05",
++                "admin_state": "in-service",
++                "association": "associated",
++                "operability": "operable",
++                "oper_state": "ok",
++                "oper_state_code": 0,
++                "memory": "262144",
++                "model": "UCSC-C220-M5SX",
++                "num_adaptors": "1",
++                "num_cores": "32",
++                "num_cpus": "2",
++                "num_vEths": "2",
++                "num_vFCs": "2",
++                "serial": "WZP0000",
++                "adaptors": {},
++            }
++        }
+     return domain
+ 
+ 
+@@ -190,10 +224,12 @@ def test_f11_none_handles_do_not_raise():
+ def test_f11_one_broken_handle_does_not_block_the_others():
+     """A domain whose disconnect raises must not strand the other domains."""
+     healthy = _FakeHandle()
+-    _run_cleanup({
+-        "10.0.0.1": {"cli": _RaisingHandle(), "sdk": _RaisingHandle()},
+-        "10.0.0.2": {"cli": healthy, "sdk": _FakeHandle()},
+-    })
++    _run_cleanup(
++        {
++            "10.0.0.1": {"cli": _RaisingHandle(), "sdk": _RaisingHandle()},
++            "10.0.0.2": {"cli": healthy, "sdk": _FakeHandle()},
++        }
++    )
+     assert healthy.closed, "second domain was skipped after the first raised"
+ 
+ 
+@@ -251,8 +287,7 @@ def test_f2_missing_pickle_is_treated_as_first_run():
+ # --------------------------------------------------------------------------
+ def _health_output(*, output_ok, sdk, cli, no_ssh=False):
+     _reset_state()
+-    utm.user_args.update(output_format="influxdb-lp", verify_only=False,
+-                         no_ssh=no_ssh)
++    utm.user_args.update(output_format="influxdb-lp", verify_only=False, no_ssh=no_ssh)
+     utm.domain_dict["10.0.0.1"] = ["user", "pass"]
+     if sdk:
+         utm.raw_sdk_stats["10.0.0.1"] = {"TopSystem": ["mo"]}
+@@ -303,8 +338,7 @@ def test_f4_is_silent_for_the_dict_output_format():
+ 
+ def test_f4_emits_one_line_per_domain():
+     _reset_state()
+-    utm.user_args.update(output_format="influxdb-lp", verify_only=False,
+-                         no_ssh=True)
++    utm.user_args.update(output_format="influxdb-lp", verify_only=False, no_ssh=True)
+     utm.domain_dict.update({"10.0.0.1": ["u", "p"], "10.0.0.2": ["u", "p"]})
+     utm.raw_sdk_stats["10.0.0.1"] = {"TopSystem": ["mo"]}
+ 
+@@ -319,8 +353,11 @@ def test_f4_emits_one_line_per_domain():
+ 
+ 
+ def main():
+-    tests = [(name, obj) for name, obj in sorted(globals().items())
+-             if name.startswith("test_") and callable(obj)]
++    tests = [
++        (name, obj)
++        for name, obj in sorted(globals().items())
++        if name.startswith("test_") and callable(obj)
++    ]
+     failed = []
+     for name, test in tests:
+         try:
+-- 
+2.43.0
+
+
+From 2e7d96df9d07a53cf7d635e5e2468d1ea99d610f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 09:28:29 +0000
+Subject: [PATCH 7/7] Fix two validation verdicts found by end-to-end testing
+
+Running collect_validation.sh against simulated hosts in both credential
+modes, as a real telegraf user with a venv, surfaced two ways the report
+could mislead:
+
+- audit_stats_interval.py reported "Intervals diverge" (exit 1) when a UCS
+  domain could not be reached. A failed query proves nothing either way.
+  It now exits 2 with "Not verified" when no domain disagreed but some could
+  not be queried, and only exits 1 on an actual mismatch.
+- The collector copies and the UCSM audit inherited the proxy variables of
+  the admin's shell. On SUSE, /etc/sysconfig/proxy commonly exports
+  https_proxy, so validation would route through a proxy that production
+  never uses and report reachable domains as down. Network-facing runs now
+  drop the shell's proxy variables and take the telegraf service's own,
+  from `systemctl show -p Environment telegraf`. Verified with a stubbed
+  service environment: HTTPS_PROXY is honored, NO_PROXY hosts go direct.
+
+Also: the report summary now carries the before/after result (lines,
+malformed lines, exit codes). shellcheck clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+(cherry picked from commit d92912a241114fc64765c2984f165588292fe7e7)
+---
+ tools/audit_stats_interval.py | 41 +++++++++++++++++-----------
+ tools/collect_validation.sh   | 50 +++++++++++++++++++++++++++++------
+ 2 files changed, 67 insertions(+), 24 deletions(-)
+
+diff --git a/tools/audit_stats_interval.py b/tools/audit_stats_interval.py
+index 5209a5c..3e09b74 100755
+--- a/tools/audit_stats_interval.py
++++ b/tools/audit_stats_interval.py
+@@ -28,7 +28,8 @@ Usage (credentials from either mode, see credsource.py):
+     (default: /etc/telegraf/telegraf.conf and /etc/telegraf/telegraf.d).
+     -d names a dashboard JSON to read [[polling_interval]] from.
+ 
+-Exits 0 when the intervals agree, 1 when they diverge, 2 on an error.
++Exits 0 when the intervals agree, 1 when they diverge, 2 when they
++could not be verified (a UCS domain unreachable, bad credentials, bad args).
+ """
+ 
+ # Kept compatible with Python 3.6, which is what the CentOS 7 UTM VM ships:
+@@ -264,7 +265,7 @@ def main():
+         print(f"error: {exc}", file=sys.stderr)
+         return 2
+ 
+-    all_agreed = True
++    queried, failed, diverged = 0, 0, 0
+     for domain in domains:
+         try:
+             policies = ucsm_policy_intervals(domain.host, domain.user,
+@@ -272,22 +273,30 @@ def main():
+         except Exception as exc:
+             print(f"\n{domain.host}\n  ! query failed: {type(exc).__name__}: {exc}",
+                   file=sys.stderr)
+-            all_agreed = False
++            failed += 1
+             continue
++        queried += 1
+         if not report_domain(domain.host, policies, telegraf_s, dashboard_s):
+-            all_agreed = False
+-
+-    if all_agreed:
+-        print("\nAll intervals agree. Bandwidth figures are on the right scale.")
+-        return 0
+-
+-    print("\nIntervals diverge. Until they match, bandwidth panels are off by "
+-          "the ratio shown above.\nFix by aligning the UCSM policy to the "
+-          "scrape interval, or by setting [[polling_interval]] to the UCSM "
+-          "value.\nThe durable fix is F6 in the RFC: read timeCollected / "
+-          "intervals in the collector\nand export a real rate, so no dashboard "
+-          "constant is involved.")
+-    return 1
++            diverged += 1
++
++    # A domain that could not be queried proves nothing either way: never
++    # report it as a mismatch, or a network problem reads as a data problem.
++    if diverged:
++        print("\nIntervals diverge. Until they match, bandwidth panels are off by "
++              "the ratio shown above.\nFix by aligning the UCSM policy to the "
++              "scrape interval, or by setting [[polling_interval]] to the UCSM "
++              "value.\nThe durable fix is F6 in the RFC: read timeCollected / "
++              "intervals in the collector\nand export a real rate, so no dashboard "
++              "constant is involved.")
++        if failed:
++            print(f"({failed} domain(s) could not be queried and are not counted.)")
++        return 1
++    if failed:
++        print(f"\nNot verified: {failed} of {len(domains)} domain(s) could not be "
++              f"queried. {queried} agreed. Fix connectivity and run again.")
++        return 2
++    print("\nAll intervals agree. Bandwidth figures are on the right scale.")
++    return 0
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tools/collect_validation.sh b/tools/collect_validation.sh
+index 3d83078..016692f 100755
+--- a/tools/collect_validation.sh
++++ b/tools/collect_validation.sh
+@@ -109,8 +109,29 @@ else
+     RUNAS=(sudo -u "$TG_USER" --)
+ fi
+ 
++# Network-facing runs get the proxy settings of the telegraf SERVICE, not of
++# this shell: a corporate https_proxy in the admin's environment (on SUSE,
++# /etc/sysconfig/proxy) would otherwise route the validation through a proxy
++# that production never uses, and make reachable domains look unreachable.
++NET_ENV=(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY
++         -u no_proxy -u NO_PROXY -u all_proxy -u ALL_PROXY)
++SERVICE_PROXY=""
++read -r -a _svc_env <<< "$(systemctl show -p Environment --value telegraf 2>/dev/null || true)"
++for kv in ${_svc_env[@]+"${_svc_env[@]}"}; do
++    case "$kv" in
++        [Hh][Tt][Tt][Pp]_[Pp][Rr][Oo][Xx][Yy]=*|[Hh][Tt][Tt][Pp][Ss]_[Pp][Rr][Oo][Xx][Yy]=*|\
++        [Nn][Oo]_[Pp][Rr][Oo][Xx][Yy]=*|[Aa][Ll][Ll]_[Pp][Rr][Oo][Xx][Yy]=*)
++            NET_ENV+=("$kv")
++            SERVICE_PROXY="${SERVICE_PROXY:+$SERVICE_PROXY }${kv%%=*} (do serviço)"
++            ;;
++    esac
++done
++
+ as_tg() { "${RUNAS[@]}" "$@"; }
+ 
++# as the telegraf user, with the telegraf service's proxy settings
++as_tg_net() { "${RUNAS[@]}" "${NET_ENV[@]}" "$@"; }
++
+ section() { printf '\n===== %s =====\n' "$*"; }
+ 
+ series_keys() { awk 'NF {print $1}' "$1" | sort -u; }
+@@ -137,6 +158,7 @@ PROD_TESTS="?"
+ NEW_TESTS="?"
+ PICKLE_RC="?"
+ AUDIT_RC="?"
++RUN_SUMMARY="pulado"
+ 
+ {
+ section "0. contexto"
+@@ -149,6 +171,7 @@ echo "usuario telegraf: $TG_USER"
+ echo "modo credencial : $MODE"
+ echo "coletor produção: $PROD_COLLECTOR"
+ echo "blocos exec UTM : $EXEC_COUNT"
++echo "proxy na coleta : ${SERVICE_PROXY:-nenhum (o serviço telegraf não define; o do shell foi removido)}"
+ if [ "$MODE" = env ]; then
+     echo "comando telegraf: $EXEC_CMD"
+     echo "creds.env       : $(stat -c '%a %U:%G' "$CREDS_FILE" 2>&1)"
+@@ -203,9 +226,9 @@ DASH_ARGS=()
+ "$PY" "$STAGE/tools/audit_stats_interval.py" --no-ucs ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
+ 
+ section "7. F6 — intervalos, lado UCSM"
+-as_tg "$PY" "$STAGE/tools/audit_stats_interval.py" "${CRED_ARGS[@]}" ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
++as_tg_net "$PY" "$STAGE/tools/audit_stats_interval.py" "${CRED_ARGS[@]}" ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
+ AUDIT_RC=$?
+-echo "exit=$AUDIT_RC  (0 = batem, 1 = divergem, 2 = erro)"
++echo "exit=$AUDIT_RC  (0 = batem, 1 = divergem, 2 = não verificado)"
+ 
+ section "8. saída antes x depois (cópias isoladas, como $TG_USER)"
+ if [ "$PREFLIGHT_RC" -ne 0 ]; then
+@@ -226,15 +249,22 @@ else
+     for side in antes depois; do
+         collector="$RUN/$side/ucs_traffic_monitor.py"
+         if [ "$MODE" = env ]; then
+-            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" \
++            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" "${NET_ENV[@]}" \
+                 "$PY" "$STAGE/tools/credsource.py" exec "$CREDS_FILE" -- \
+                 "$PY" "$collector" influxdb-lp --instance-name "validacao_$side" -dss \
+                 > "$RUN/$side.lp" 2> "$RUN/$side.err"
+         else
+-            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" "$PY" "$collector" "$RUN/validacao_grp.txt" \
++            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" "${NET_ENV[@]}" "$PY" "$collector" "$RUN/validacao_grp.txt" \
+                 influxdb-lp -dss > "$RUN/$side.lp" 2> "$RUN/$side.err"
+         fi
+-        echo "$side: exit=$? linhas=$(grep -c . "$RUN/$side.lp")"
++        rc=$?
++        lines="$(grep -c . "$RUN/$side.lp")"
++        echo "$side: exit=$rc linhas=$lines"
++        if [ "$side" = antes ]; then
++            RC_antes=$rc; LINES_antes=$lines
++        else
++            RC_depois=$rc; LINES_depois=$lines
++        fi
+     done
+ 
+     echo
+@@ -251,9 +281,12 @@ else
+ 
+     echo
+     echo "--- F3: linhas malformadas (antes) ---"
+-    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/antes.lp"
++    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/antes.lp" | tee "$RUN/lint_antes.txt"
+     echo "--- F3: linhas malformadas (depois) ---"
+-    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/depois.lp"
++    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/depois.lp" | tee "$RUN/lint_depois.txt"
++    bad_antes="$(awk '/malformed:/ {print $NF; exit}' "$RUN/lint_antes.txt")"
++    bad_depois="$(awk '/malformed:/ {print $NF; exit}' "$RUN/lint_depois.txt")"
++    RUN_SUMMARY="linhas ${LINES_antes:-?} -> ${LINES_depois:-?}, malformadas ${bad_antes:-?} -> ${bad_depois:-?}, exit ${RC_antes:-?} -> ${RC_depois:-?}"
+ 
+     echo
+     echo "--- F4: saúde da coleta (depois) ---"
+@@ -278,7 +311,8 @@ printf '  %-34s %s\n' \
+     "testes x produção (esperado 0/16)" "$PROD_TESTS" \
+     "testes x novo     (esperado 16/16)" "$NEW_TESTS" \
+     "senha em claro no pickle"          "$(case "$PICKLE_RC" in 1) echo SIM;; 0) echo não;; *) echo "erro ($PICKLE_RC)";; esac)" \
+-    "intervalos UCSM/telegraf/dash"     "$(case "$AUDIT_RC" in 0) echo batem;; 1) echo DIVERGEM;; *) echo "erro ($AUDIT_RC)";; esac)"
++    "saída antes -> depois"             "$RUN_SUMMARY" \
++    "intervalos UCSM/telegraf/dash"     "$(case "$AUDIT_RC" in 0) echo batem;; 1) echo DIVERGEM;; 2) echo "não verificado (UCSM inacessível?)";; *) echo "erro ($AUDIT_RC)";; esac)"
+ } > "$REPORT.raw" 2>&1
+ 
+ # IP addresses become IP-1, IP-2... consistently, so the analysis still works
+-- 
+2.43.0
+
