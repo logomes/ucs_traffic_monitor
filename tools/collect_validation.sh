@@ -109,7 +109,28 @@ else
     RUNAS=(sudo -u "$TG_USER" --)
 fi
 
+# Network-facing runs get the proxy settings of the telegraf SERVICE, not of
+# this shell: a corporate https_proxy in the admin's environment (on SUSE,
+# /etc/sysconfig/proxy) would otherwise route the validation through a proxy
+# that production never uses, and make reachable domains look unreachable.
+NET_ENV=(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY
+         -u no_proxy -u NO_PROXY -u all_proxy -u ALL_PROXY)
+SERVICE_PROXY=""
+read -r -a _svc_env <<< "$(systemctl show -p Environment --value telegraf 2>/dev/null || true)"
+for kv in ${_svc_env[@]+"${_svc_env[@]}"}; do
+    case "$kv" in
+        [Hh][Tt][Tt][Pp]_[Pp][Rr][Oo][Xx][Yy]=*|[Hh][Tt][Tt][Pp][Ss]_[Pp][Rr][Oo][Xx][Yy]=*|\
+        [Nn][Oo]_[Pp][Rr][Oo][Xx][Yy]=*|[Aa][Ll][Ll]_[Pp][Rr][Oo][Xx][Yy]=*)
+            NET_ENV+=("$kv")
+            SERVICE_PROXY="${SERVICE_PROXY:+$SERVICE_PROXY }${kv%%=*} (do serviço)"
+            ;;
+    esac
+done
+
 as_tg() { "${RUNAS[@]}" "$@"; }
+
+# as the telegraf user, with the telegraf service's proxy settings
+as_tg_net() { "${RUNAS[@]}" "${NET_ENV[@]}" "$@"; }
 
 section() { printf '\n===== %s =====\n' "$*"; }
 
@@ -137,6 +158,7 @@ PROD_TESTS="?"
 NEW_TESTS="?"
 PICKLE_RC="?"
 AUDIT_RC="?"
+RUN_SUMMARY="pulado"
 
 {
 section "0. contexto"
@@ -149,6 +171,7 @@ echo "usuario telegraf: $TG_USER"
 echo "modo credencial : $MODE"
 echo "coletor produção: $PROD_COLLECTOR"
 echo "blocos exec UTM : $EXEC_COUNT"
+echo "proxy na coleta : ${SERVICE_PROXY:-nenhum (o serviço telegraf não define; o do shell foi removido)}"
 if [ "$MODE" = env ]; then
     echo "comando telegraf: $EXEC_CMD"
     echo "creds.env       : $(stat -c '%a %U:%G' "$CREDS_FILE" 2>&1)"
@@ -203,9 +226,9 @@ DASH_ARGS=()
 "$PY" "$STAGE/tools/audit_stats_interval.py" --no-ucs ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
 
 section "7. F6 — intervalos, lado UCSM"
-as_tg "$PY" "$STAGE/tools/audit_stats_interval.py" "${CRED_ARGS[@]}" ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
+as_tg_net "$PY" "$STAGE/tools/audit_stats_interval.py" "${CRED_ARGS[@]}" ${TG_ARGS[@]+"${TG_ARGS[@]}"} ${DASH_ARGS[@]+"${DASH_ARGS[@]}"}
 AUDIT_RC=$?
-echo "exit=$AUDIT_RC  (0 = batem, 1 = divergem, 2 = erro)"
+echo "exit=$AUDIT_RC  (0 = batem, 1 = divergem, 2 = não verificado)"
 
 section "8. saída antes x depois (cópias isoladas, como $TG_USER)"
 if [ "$PREFLIGHT_RC" -ne 0 ]; then
@@ -226,15 +249,22 @@ else
     for side in antes depois; do
         collector="$RUN/$side/ucs_traffic_monitor.py"
         if [ "$MODE" = env ]; then
-            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" \
+            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" "${NET_ENV[@]}" \
                 "$PY" "$STAGE/tools/credsource.py" exec "$CREDS_FILE" -- \
                 "$PY" "$collector" influxdb-lp --instance-name "validacao_$side" -dss \
                 > "$RUN/$side.lp" 2> "$RUN/$side.err"
         else
-            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" "$PY" "$collector" "$RUN/validacao_grp.txt" \
+            timeout "$RUN_TIMEOUT" "${RUNAS[@]}" "${NET_ENV[@]}" "$PY" "$collector" "$RUN/validacao_grp.txt" \
                 influxdb-lp -dss > "$RUN/$side.lp" 2> "$RUN/$side.err"
         fi
-        echo "$side: exit=$? linhas=$(grep -c . "$RUN/$side.lp")"
+        rc=$?
+        lines="$(grep -c . "$RUN/$side.lp")"
+        echo "$side: exit=$rc linhas=$lines"
+        if [ "$side" = antes ]; then
+            RC_antes=$rc; LINES_antes=$lines
+        else
+            RC_depois=$rc; LINES_depois=$lines
+        fi
     done
 
     echo
@@ -251,9 +281,12 @@ else
 
     echo
     echo "--- F3: linhas malformadas (antes) ---"
-    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/antes.lp"
+    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/antes.lp" | tee "$RUN/lint_antes.txt"
     echo "--- F3: linhas malformadas (depois) ---"
-    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/depois.lp"
+    "$PY" "$STAGE/tools/lp_lint.py" "$RUN/depois.lp" | tee "$RUN/lint_depois.txt"
+    bad_antes="$(awk '/malformed:/ {print $NF; exit}' "$RUN/lint_antes.txt")"
+    bad_depois="$(awk '/malformed:/ {print $NF; exit}' "$RUN/lint_depois.txt")"
+    RUN_SUMMARY="linhas ${LINES_antes:-?} -> ${LINES_depois:-?}, malformadas ${bad_antes:-?} -> ${bad_depois:-?}, exit ${RC_antes:-?} -> ${RC_depois:-?}"
 
     echo
     echo "--- F4: saúde da coleta (depois) ---"
@@ -278,7 +311,8 @@ printf '  %-34s %s\n' \
     "testes x produção (esperado 0/16)" "$PROD_TESTS" \
     "testes x novo     (esperado 16/16)" "$NEW_TESTS" \
     "senha em claro no pickle"          "$(case "$PICKLE_RC" in 1) echo SIM;; 0) echo não;; *) echo "erro ($PICKLE_RC)";; esac)" \
-    "intervalos UCSM/telegraf/dash"     "$(case "$AUDIT_RC" in 0) echo batem;; 1) echo DIVERGEM;; *) echo "erro ($AUDIT_RC)";; esac)"
+    "saída antes -> depois"             "$RUN_SUMMARY" \
+    "intervalos UCSM/telegraf/dash"     "$(case "$AUDIT_RC" in 0) echo batem;; 1) echo DIVERGEM;; 2) echo "não verificado (UCSM inacessível?)";; *) echo "erro ($AUDIT_RC)";; esac)"
 } > "$REPORT.raw" 2>&1
 
 # IP addresses become IP-1, IP-2... consistently, so the analysis still works

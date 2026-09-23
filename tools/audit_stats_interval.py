@@ -28,7 +28,8 @@ Usage (credentials from either mode, see credsource.py):
     (default: /etc/telegraf/telegraf.conf and /etc/telegraf/telegraf.d).
     -d names a dashboard JSON to read [[polling_interval]] from.
 
-Exits 0 when the intervals agree, 1 when they diverge, 2 on an error.
+Exits 0 when the intervals agree, 1 when they diverge, 2 when they
+could not be verified (a UCS domain unreachable, bad credentials, bad args).
 """
 
 # Kept compatible with Python 3.6, which is what the CentOS 7 UTM VM ships:
@@ -264,7 +265,7 @@ def main():
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    all_agreed = True
+    queried, failed, diverged = 0, 0, 0
     for domain in domains:
         try:
             policies = ucsm_policy_intervals(domain.host, domain.user,
@@ -272,22 +273,30 @@ def main():
         except Exception as exc:
             print(f"\n{domain.host}\n  ! query failed: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
-            all_agreed = False
+            failed += 1
             continue
+        queried += 1
         if not report_domain(domain.host, policies, telegraf_s, dashboard_s):
-            all_agreed = False
+            diverged += 1
 
-    if all_agreed:
-        print("\nAll intervals agree. Bandwidth figures are on the right scale.")
-        return 0
-
-    print("\nIntervals diverge. Until they match, bandwidth panels are off by "
-          "the ratio shown above.\nFix by aligning the UCSM policy to the "
-          "scrape interval, or by setting [[polling_interval]] to the UCSM "
-          "value.\nThe durable fix is F6 in the RFC: read timeCollected / "
-          "intervals in the collector\nand export a real rate, so no dashboard "
-          "constant is involved.")
-    return 1
+    # A domain that could not be queried proves nothing either way: never
+    # report it as a mismatch, or a network problem reads as a data problem.
+    if diverged:
+        print("\nIntervals diverge. Until they match, bandwidth panels are off by "
+              "the ratio shown above.\nFix by aligning the UCSM policy to the "
+              "scrape interval, or by setting [[polling_interval]] to the UCSM "
+              "value.\nThe durable fix is F6 in the RFC: read timeCollected / "
+              "intervals in the collector\nand export a real rate, so no dashboard "
+              "constant is involved.")
+        if failed:
+            print(f"({failed} domain(s) could not be queried and are not counted.)")
+        return 1
+    if failed:
+        print(f"\nNot verified: {failed} of {len(domains)} domain(s) could not be "
+              f"queried. {queried} agreed. Fix connectivity and run again.")
+        return 2
+    print("\nAll intervals agree. Bandwidth figures are on the right scale.")
+    return 0
 
 
 if __name__ == "__main__":
