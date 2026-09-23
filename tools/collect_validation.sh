@@ -221,8 +221,8 @@ shopt -s nullglob
 PICKLES=("$UTM_DIR"/*.pickle)
 shopt -u nullglob
 if [ "${#PICKLES[@]}" -eq 0 ]; then
-    echo "nenhum .pickle em $UTM_DIR"
-    PICKLE_RC=0
+    echo "nenhum .pickle em $UTM_DIR (o coletor grava ao lado de si mesmo)"
+    PICKLE_RC=none
 else
     as_tg "$PY" "$STAGE/tools/check_pickle_exposure.py" "${CRED_ARGS[@]}" "${PICKLES[@]}"
     PICKLE_RC=$?
@@ -320,7 +320,7 @@ printf '  %-34s %s\n' \
     "preflight"                        "$([ "$PREFLIGHT_RC" -eq 0 ] && echo OK || echo FALHOU)" \
     "testes x produção (esperado 0/16)" "$PROD_TESTS" \
     "testes x novo     (esperado 16/16)" "$NEW_TESTS" \
-    "senha em claro no pickle"          "$(case "$PICKLE_RC" in 1) echo SIM;; 0) echo não;; *) echo "erro ($PICKLE_RC)";; esac)" \
+    "senha em claro no pickle"          "$(case "$PICKLE_RC" in 1) echo SIM;; 0) echo não;; none) echo "sem .pickle";; *) echo "erro ($PICKLE_RC)";; esac)" \
     "saída antes -> depois"             "$RUN_SUMMARY" \
     "intervalos UCSM/telegraf/dash"     "$(case "$AUDIT_RC" in 0) echo batem;; 1) echo DIVERGEM;; 2) echo "não verificado (UCSM inacessível?)";; *) echo "erro ($AUDIT_RC)";; esac)"
 } > "$REPORT.raw" 2>&1
