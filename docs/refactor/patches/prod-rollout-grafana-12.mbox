@@ -1,7 +1,7 @@
 From 4befc0f2eb8f3a7b61b7a068814f5af353348578 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 20 Sep 2026 19:40:19 +0000
-Subject: [PATCH 01/10] Add modernization RFC with verified findings and
+Subject: [PATCH 01/11] Add modernization RFC with verified findings and
  reproduction harness
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1230,7 +1230,7 @@ index 0000000..94a7953
 From 54b7f11d91945be94942687a2d884ba94d80789e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 21 Sep 2026 02:00:08 +0000
-Subject: [PATCH 02/10] Apply the five quick fixes from the RFC (section 9)
+Subject: [PATCH 02/11] Apply the five quick fixes from the RFC (section 9)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -2473,7 +2473,7 @@ index 0000000..468ee7a
 From 2e86294745dfa33bd414f32d8ed5aa369205f3c0 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 03:30:46 +0000
-Subject: [PATCH 03/10] Add preflight check and unpin netmiko for modern Python
+Subject: [PATCH 03/11] Add preflight check and unpin netmiko for modern Python
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -2706,7 +2706,7 @@ index 0000000..66bee50
 From be4149116afced6fe4b94557ff5450f51bc95245 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:22:06 +0000
-Subject: [PATCH 04/10] Add validation tooling that works in both credential
+Subject: [PATCH 04/11] Add validation tooling that works in both credential
  modes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -4010,7 +4010,7 @@ index 66bee50..db119df 100755
 From aea563da503866d74ad9065a011d62c0c765a607 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:24:57 +0000
-Subject: [PATCH 05/10] Disable setuptools package discovery so the CI install
+Subject: [PATCH 05/11] Disable setuptools package discovery so the CI install
  step works
 
 `pip install -e .[dev]`, the CI's install step, aborts with "Multiple
@@ -4052,7 +4052,7 @@ index 44c2d99..c266b90 100644
 From 0af85a1e37b33fe92bf37cfea6557440b367bf64 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:24:58 +0000
-Subject: [PATCH 06/10] Require netmiko 4.4+ and match the branch's lint rules
+Subject: [PATCH 06/11] Require netmiko 4.4+ and match the branch's lint rules
 
 - pyproject.toml: netmiko>=4.0 becomes >=4.4.0. Below 4.4, netmiko imports
   the stdlib telnetlib, which Python 3.13 removed, so the collector dies at
@@ -4296,7 +4296,7 @@ index d557591..21d44a6 100644
 From 2e7d96df9d07a53cf7d635e5e2468d1ea99d610f Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:28:29 +0000
-Subject: [PATCH 07/10] Fix two validation verdicts found by end-to-end testing
+Subject: [PATCH 07/11] Fix two validation verdicts found by end-to-end testing
 
 Running collect_validation.sh against simulated hosts in both credential
 modes, as a real telegraf user with a venv, surfaced two ways the report
@@ -4513,7 +4513,7 @@ index 3d83078..016692f 100755
 From e46251a08905323fc8f775484a43d22ab281215c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:31:47 +0000
-Subject: [PATCH 08/10] Keep validation runs from writing bytecode into the
+Subject: [PATCH 08/11] Keep validation runs from writing bytecode into the
  production directory
 
 Pointing the test suite (or preflight) at a production collector imports
@@ -4605,7 +4605,7 @@ index db119df..12b0e45 100755
 From 09effaeebb7a59e158f8e898edc336938fbb052c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:33:32 +0000
-Subject: [PATCH 09/10] Report a missing pickle as such in the validation
+Subject: [PATCH 09/11] Report a missing pickle as such in the validation
  summary
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -4652,7 +4652,7 @@ index 17f71fa..a310add 100755
 From e7658751474666a07016f7bb7da4c1918d1dc1fe Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:46:21 +0000
-Subject: [PATCH 10/10] Refuse to run when the package sits inside the output
+Subject: [PATCH 10/11] Refuse to run when the package sits inside the output
  directory
 
 Extracting the package in /tmp puts it at /tmp/utm-validacao, which is
@@ -4694,6 +4694,207 @@ index a310add..bd450b3 100755
  rm -rf "$OUT"
  install -d -m 0750 -o "$TG_USER" "$OUT"
  STAGE="$OUT/pkg"
+-- 
+2.43.0
+
+
+From f881e59856f3501cbeba28f4a9fa314f32eb4f45 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 11:00:01 +0000
+Subject: [PATCH 11/11] Make preflight find the packaged collector and check
+ the interpreter
+
+Run from the validation package, preflight looked only for the repo
+layout, so it reported "collector not found" and, with no collector,
+"credentials module: not needed (file mode)". It now reads the UTM
+command from telegraf's config, picks the package variant matching the
+production collector's credential mode, and fails when it is not run with
+the interpreter telegraf uses, since the result means nothing otherwise.
+The pip hint names the running interpreter instead of a bare python3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+---
+ tools/collect_validation.sh |  2 +-
+ tools/preflight.py          | 99 +++++++++++++++++++++++++++++++++----
+ 2 files changed, 91 insertions(+), 10 deletions(-)
+
+diff --git a/tools/collect_validation.sh b/tools/collect_validation.sh
+index bd450b3..c1b94c4 100755
+--- a/tools/collect_validation.sh
++++ b/tools/collect_validation.sh
+@@ -196,7 +196,7 @@ fi
+ [ "$EXEC_COUNT" -gt 1 ] && echo "aviso           : mais de um bloco exec do UTM; validando o primeiro"
+ 
+ section "1. preflight (como $TG_USER, com o python do telegraf)"
+-as_tg env UTM_COLLECTOR="$NEW_COLLECTOR" "$PY" "$STAGE/tools/preflight.py"
++as_tg env UTM_COLLECTOR="$NEW_COLLECTOR" TELEGRAF_CONF="${TELEGRAF_CONF:-}" "$PY" "$STAGE/tools/preflight.py"
+ PREFLIGHT_RC=$?
+ 
+ section "2. integridade do pacote"
+diff --git a/tools/preflight.py b/tools/preflight.py
+index 12b0e45..d6683a7 100755
+--- a/tools/preflight.py
++++ b/tools/preflight.py
+@@ -22,13 +22,32 @@ Exits 0 when the host can run the collector, 1 when it cannot.
+ # Kept runnable on Python 3.6 through at least 3.14 so it can diagnose any host.
+ from __future__ import print_function
+ 
++import glob
+ import os
++import re
++import shlex
+ import sys
+ 
+ # Importing credentials.py next to a production collector must not leave a
+ # __pycache__ directory behind there.
+ sys.dont_write_bytecode = True
+ 
++
++
++def telegraf_configs():
++    """TELEGRAF_CONF (colon-separated files or dirs, as in
++    collect_validation.sh), else the packaged telegraf locations."""
++    entries = (os.environ.get("TELEGRAF_CONF")
++               or "/etc/telegraf/telegraf.conf:/etc/telegraf/telegraf.d")
++    paths = []
++    for entry in entries.split(":"):
++        if os.path.isdir(entry):
++            paths.extend(sorted(glob.glob(os.path.join(entry, "*.conf"))))
++        elif entry:
++            paths.append(entry)
++    return paths
++
++
+ # netmiko below this vendors nothing and needs the stdlib telnetlib
+ NETMIKO_MIN_ON_PY313 = (4, 4, 0)
+ 
+@@ -79,8 +98,32 @@ def check_netmiko():
+     return True, raw
+ 
+ 
++def telegraf_command():
++    """The first UTM command in telegraf's config, split into argv, or None."""
++    for path in telegraf_configs():
++        try:
++            with open(path) as handle:
++                text = handle.read()
++        except (IOError, OSError):
++            continue
++        for quoted in re.findall(r'"([^"]*ucs_traffic_monitor\.py[^"]*)"', text):
++            return shlex.split(quoted)
++    return None
++
++
++def production_collector():
++    argv = telegraf_command()
++    if not argv:
++        return None
++    for arg in argv:
++        if arg.endswith("ucs_traffic_monitor.py"):
++            return arg
++    return None
++
++
+ def find_collector():
+-    """UTM_COLLECTOR, else the repo layout, else the package layouts."""
++    """UTM_COLLECTOR, else the repo layout, else the package variant that
++    matches the production collector's credential mode."""
+     explicit = os.environ.get("UTM_COLLECTOR")
+     if explicit:
+         return explicit
+@@ -90,9 +133,43 @@ def find_collector():
+                       os.path.join(root, "ucs_traffic_monitor.py")):
+         if os.path.exists(candidate):
+             return candidate
++    production = production_collector()
++    if production and os.path.exists(production):
++        variant = os.path.join(root, "coletor", "modo-" + collector_mode(production),
++                               "ucs_traffic_monitor.py")
++        if os.path.exists(variant):
++            return variant
+     return None
+ 
+ 
++def resolve_interpreter(name):
++    if os.sep not in name:
++        # telegraf's systemd unit searches the standard PATH, not root's
++        for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin",
++                          "/usr/bin", "/sbin", "/bin"):
++            candidate = os.path.join(directory, name)
++            if os.access(candidate, os.X_OK):
++                name = candidate
++                break
++        else:
++            return None
++    return os.path.realpath(name)
++
++
++def check_telegraf_python():
++    """This run only means something with the interpreter telegraf uses."""
++    argv = telegraf_command()
++    if not argv:
++        return True, "no UTM inputs.exec found in the telegraf config; not compared"
++    telegraf_python = resolve_interpreter(argv[0])
++    if telegraf_python is None:
++        return False, "telegraf runs '{}', which is not on the standard PATH".format(argv[0])
++    if telegraf_python != os.path.realpath(sys.executable):
++        return False, "telegraf runs {} -> {}; rerun this with it".format(
++            argv[0], telegraf_python)
++    return True, "{} (same as this run)".format(argv[0])
++
++
+ def collector_mode(path):
+     with open(path) as handle:
+         source = handle.read()
+@@ -104,6 +181,9 @@ def check_collector_syntax():
+ 
+     path = find_collector()
+     if not path or not os.path.exists(path):
++        production = production_collector()
++        if production and not os.path.exists(production):
++            return False, "telegraf points at {}, which does not exist".format(production)
+         return False, "collector not found; set UTM_COLLECTOR=/path/to/it"
+     with open(path) as handle:
+         ast.parse(handle.read(), filename=path)
+@@ -113,7 +193,9 @@ def check_collector_syntax():
+ def check_credentials_module():
+     """Env mode only: credentials.py must sit next to the collector."""
+     path = find_collector()
+-    if not path or collector_mode(path) != "env":
++    if not path or not os.path.exists(path):
++        return False, "skipped: collector not found"
++    if collector_mode(path) != "env":
+         return True, "not needed (file mode)"
+     if sys.version_info < (3, 7):
+         return False, "env mode needs Python 3.7+ (project declares 3.10+)"
+@@ -127,6 +209,7 @@ def main():
+     print("-" * 60)
+     results = [
+         check("python", check_python),
++        check("telegraf python", check_telegraf_python),
+         check("ucsmsdk", check_ucsmsdk),
+         check("netmiko", check_netmiko),
+         check("collector syntax", check_collector_syntax),
+@@ -139,13 +222,11 @@ def main():
+         return 0
+ 
+     print("Host CANNOT run the collector as is.")
+-    if sys.version_info >= (3, 13):
+-        print("")
+-        print("If netmiko is the failing line, this fixes it:")
+-        print("    python3 -m pip install -U 'netmiko>=4.4.0'")
+-        print("")
+-        print("The ansible playbook in this repo pins netmiko==4.0.0, which")
+-        print("cannot import on Python 3.13+. That pin needs updating too.")
++    print("")
++    print("Missing or old ucsmsdk / netmiko for THIS interpreter:")
++    print("    {} -m pip install -U ucsmsdk 'netmiko>=4.4.0'".format(sys.executable))
++    print("Install them only into the interpreter telegraf runs (line")
++    print("'telegraf python'); anything else does not change production.")
+     return 1
+ 
+ 
 -- 
 2.43.0
 
