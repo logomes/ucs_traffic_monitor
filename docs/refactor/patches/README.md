@@ -17,7 +17,7 @@ git checkout -b quick-fixes origin/feat/prod-rollout-grafana-12
 git am docs/refactor/patches/prod-rollout-grafana-12.mbox   # a partir de um checkout desta branch
 ```
 
-São 7 commits. Os 4 primeiros e o último são os mesmos deste PR, com um
+São 9 commits. Os 4 primeiros e os 3 últimos são os mesmos deste PR, com um
 conflito trivial resolvido (`.gitignore`) e o merge de 3 vias do coletor
 limpo. Dois são próprios do port:
 
