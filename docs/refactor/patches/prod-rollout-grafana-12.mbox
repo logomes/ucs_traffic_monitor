@@ -1,7 +1,7 @@
 From 4befc0f2eb8f3a7b61b7a068814f5af353348578 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 20 Sep 2026 19:40:19 +0000
-Subject: [PATCH 1/9] Add modernization RFC with verified findings and
+Subject: [PATCH 01/10] Add modernization RFC with verified findings and
  reproduction harness
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1230,7 +1230,7 @@ index 0000000..94a7953
 From 54b7f11d91945be94942687a2d884ba94d80789e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 21 Sep 2026 02:00:08 +0000
-Subject: [PATCH 2/9] Apply the five quick fixes from the RFC (section 9)
+Subject: [PATCH 02/10] Apply the five quick fixes from the RFC (section 9)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -2473,7 +2473,7 @@ index 0000000..468ee7a
 From 2e86294745dfa33bd414f32d8ed5aa369205f3c0 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 03:30:46 +0000
-Subject: [PATCH 3/9] Add preflight check and unpin netmiko for modern Python
+Subject: [PATCH 03/10] Add preflight check and unpin netmiko for modern Python
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -2706,7 +2706,7 @@ index 0000000..66bee50
 From be4149116afced6fe4b94557ff5450f51bc95245 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:22:06 +0000
-Subject: [PATCH 4/9] Add validation tooling that works in both credential
+Subject: [PATCH 04/10] Add validation tooling that works in both credential
  modes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -4010,7 +4010,7 @@ index 66bee50..db119df 100755
 From aea563da503866d74ad9065a011d62c0c765a607 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:24:57 +0000
-Subject: [PATCH 5/9] Disable setuptools package discovery so the CI install
+Subject: [PATCH 05/10] Disable setuptools package discovery so the CI install
  step works
 
 `pip install -e .[dev]`, the CI's install step, aborts with "Multiple
@@ -4052,7 +4052,7 @@ index 44c2d99..c266b90 100644
 From 0af85a1e37b33fe92bf37cfea6557440b367bf64 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:24:58 +0000
-Subject: [PATCH 6/9] Require netmiko 4.4+ and match the branch's lint rules
+Subject: [PATCH 06/10] Require netmiko 4.4+ and match the branch's lint rules
 
 - pyproject.toml: netmiko>=4.0 becomes >=4.4.0. Below 4.4, netmiko imports
   the stdlib telnetlib, which Python 3.13 removed, so the collector dies at
@@ -4296,7 +4296,7 @@ index d557591..21d44a6 100644
 From 2e7d96df9d07a53cf7d635e5e2468d1ea99d610f Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:28:29 +0000
-Subject: [PATCH 7/9] Fix two validation verdicts found by end-to-end testing
+Subject: [PATCH 07/10] Fix two validation verdicts found by end-to-end testing
 
 Running collect_validation.sh against simulated hosts in both credential
 modes, as a real telegraf user with a venv, surfaced two ways the report
@@ -4513,7 +4513,7 @@ index 3d83078..016692f 100755
 From e46251a08905323fc8f775484a43d22ab281215c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:31:47 +0000
-Subject: [PATCH 8/9] Keep validation runs from writing bytecode into the
+Subject: [PATCH 08/10] Keep validation runs from writing bytecode into the
  production directory
 
 Pointing the test suite (or preflight) at a production collector imports
@@ -4605,7 +4605,8 @@ index db119df..12b0e45 100755
 From 09effaeebb7a59e158f8e898edc336938fbb052c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 09:33:32 +0000
-Subject: [PATCH 9/9] Report a missing pickle as such in the validation summary
+Subject: [PATCH 09/10] Report a missing pickle as such in the validation
+ summary
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -4644,6 +4645,55 @@ index 17f71fa..a310add 100755
      "saída antes -> depois"             "$RUN_SUMMARY" \
      "intervalos UCSM/telegraf/dash"     "$(case "$AUDIT_RC" in 0) echo batem;; 1) echo DIVERGEM;; 2) echo "não verificado (UCSM inacessível?)";; *) echo "erro ($AUDIT_RC)";; esac)"
  } > "$REPORT.raw" 2>&1
+-- 
+2.43.0
+
+
+From e7658751474666a07016f7bb7da4c1918d1dc1fe Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 09:46:21 +0000
+Subject: [PATCH 10/10] Refuse to run when the package sits inside the output
+ directory
+
+Extracting the package in /tmp puts it at /tmp/utm-validacao, which is
+the default OUT and is wiped at the start of every run, so the script
+deleted itself before staging. It now stops with a message instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016getrRJmgohzHoA5TH2zVQ
+---
+ docs/refactor/VALIDACAO.md  | 2 +-
+ tools/collect_validation.sh | 4 ++++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/docs/refactor/VALIDACAO.md b/docs/refactor/VALIDACAO.md
+index 0877027..84a8ffd 100644
+--- a/docs/refactor/VALIDACAO.md
++++ b/docs/refactor/VALIDACAO.md
+@@ -20,7 +20,7 @@ invocação da outra.
+ ## Passo 0 — o host consegue rodar o coletor?
+ 
+ ```sh
+-tar xzf utm-validacao.tar.gz && cd utm-validacao
++cd ~ && tar xzf utm-validacao.tar.gz && cd utm-validacao    # fora de /tmp: /tmp/utm-validacao é a saída
+ python3 tools/preflight.py
+ ```
+ 
+diff --git a/tools/collect_validation.sh b/tools/collect_validation.sh
+index a310add..bd450b3 100755
+--- a/tools/collect_validation.sh
++++ b/tools/collect_validation.sh
+@@ -148,6 +148,10 @@ case "$(basename "$OUT")" in
+     *utm*) ;;
+     *) die "OUT precisa ter 'utm' no nome (proteção do rm -rf): $OUT" ;;
+ esac
++OUT="${OUT%/}"
++case "$PKG_DIR/" in
++    "$OUT"/*) die "o pacote está dentro de OUT ($OUT), que é apagado a cada execução; extraia em outro lugar (ex.: ~/utm-validacao) ou defina OUT=" ;;
++esac
+ rm -rf "$OUT"
+ install -d -m 0750 -o "$TG_USER" "$OUT"
+ STAGE="$OUT/pkg"
 -- 
 2.43.0
 
