@@ -75,19 +75,47 @@ def check_netmiko():
     return True, raw
 
 
+def find_collector():
+    """UTM_COLLECTOR, else the repo layout, else the package layouts."""
+    explicit = os.environ.get("UTM_COLLECTOR")
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(here)
+    for candidate in (os.path.join(root, "telegraf", "ucs_traffic_monitor.py"),
+                      os.path.join(root, "ucs_traffic_monitor.py")):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def collector_mode(path):
+    with open(path) as handle:
+        source = handle.read()
+    return "env" if "import credentials" in source else "file"
+
+
 def check_collector_syntax():
     import ast
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(os.path.dirname(here), "telegraf", "ucs_traffic_monitor.py")
-    if not os.path.exists(path):
-        path = os.path.join(here, "ucs_traffic_monitor.py")
-    if not os.path.exists(path):
-        return False, "ucs_traffic_monitor.py not found next to tools/"
-
+    path = find_collector()
+    if not path or not os.path.exists(path):
+        return False, "collector not found; set UTM_COLLECTOR=/path/to/it"
     with open(path) as handle:
         ast.parse(handle.read(), filename=path)
-    return True, path
+    return True, "{} ({} mode)".format(path, collector_mode(path))
+
+
+def check_credentials_module():
+    """Env mode only: credentials.py must sit next to the collector."""
+    path = find_collector()
+    if not path or collector_mode(path) != "env":
+        return True, "not needed (file mode)"
+    if sys.version_info < (3, 7):
+        return False, "env mode needs Python 3.7+ (project declares 3.10+)"
+    sys.path.insert(0, os.path.dirname(path))
+    import credentials                                        # noqa: F401
+    return True, os.path.join(os.path.dirname(path), "credentials.py")
 
 
 def main():
@@ -98,6 +126,7 @@ def main():
         check("ucsmsdk", check_ucsmsdk),
         check("netmiko", check_netmiko),
         check("collector syntax", check_collector_syntax),
+        check("credentials module", check_credentials_module),
     ]
     print("-" * 60)
 

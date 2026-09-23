@@ -41,6 +41,14 @@ def _load_collector():
             setattr(module, attr, object)
         sys.modules[name] = module
 
+    if not COLLECTOR.is_file():
+        raise SystemExit(
+            "collector not found: {}\n"
+            "set UTM_COLLECTOR=/path/to/ucs_traffic_monitor.py".format(COLLECTOR))
+
+    # The env-mode collector does `import credentials`, which lives next to it
+    sys.path.insert(0, str(COLLECTOR.parent))
+
     spec = importlib.util.spec_from_file_location("utm_under_test", COLLECTOR)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

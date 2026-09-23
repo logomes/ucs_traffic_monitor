@@ -19,12 +19,14 @@ no error anywhere. This tool reports the three values side by side.
 The stat types UTM actually reads are port (FI ports), adapter (vNIC/vHBA)
 and chassis (backplane ports).
 
-Usage:
-    ./audit_stats_interval.py -i ucs_domains_group_1.txt \
-                              -t /etc/telegraf/telegraf.conf \
-                              -d ../grafana/dashboards/domain_traffic.json
+Usage (credentials from either mode, see credsource.py):
+    ./audit_stats_interval.py --env-file /etc/utm/creds.env        # env mode
+    ./audit_stats_interval.py -i ucs_domains_group_1.txt           # file mode
+    ./audit_stats_interval.py --no-ucs                              # offline
 
-    ./audit_stats_interval.py -i ucs_domains_group_1.txt --no-ucs   # offline
+    -t adds telegraf config files or telegraf.d directories to inspect
+    (default: /etc/telegraf/telegraf.conf and /etc/telegraf/telegraf.d).
+    -d names a dashboard JSON to read [[polling_interval]] from.
 
 Exits 0 when the intervals agree, 1 when they diverge, 2 on an error.
 """
@@ -33,10 +35,18 @@ Exits 0 when the intervals agree, 1 when they diverge, 2 on an error.
 # no PEP 604 unions and no `from __future__ import annotations`.
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import credsource  # noqa: E402
+
+# Telegraf's [agent] interval when telegraf.conf sets none
+TELEGRAF_DEFAULT_INTERVAL_S = 10
+DEFAULT_TELEGRAF_PATHS = ("/etc/telegraf/telegraf.conf", "/etc/telegraf/telegraf.d")
 
 # Stat types whose deltas UTM exports. Others are collected by UCSM but
 # unused here, so a mismatch on them does not skew any UTM panel.
@@ -51,44 +61,70 @@ INTERVAL_SECONDS = {
 }
 
 
-def parse_domains(input_file):
-    # type: (Path) -> List[Tuple[str, str, str]]
-    """Read the UTM input file: IP,user,password per line, [Location] headers."""
-    domains = []
-    for raw_line in input_file.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith("["):
-            continue
-        parts = line.split(",")
-        if len(parts) < 3:
-            print(f"  ! ignoring malformed line: {raw_line!r}", file=sys.stderr)
-            continue
-        domains.append((parts[0], parts[1], parts[2]))
-    return domains
-
-
-def telegraf_exec_interval(telegraf_conf):
-    # type: (Path) -> Optional[int]
-    """Pull the interval of the inputs.exec block that runs this collector."""
-    try:
-        text = telegraf_conf.read_text()
-    except OSError as exc:
-        print(f"  ! cannot read {telegraf_conf}: {exc}", file=sys.stderr)
+def parse_duration(raw):
+    # type: (str) -> Optional[int]
+    """Telegraf durations are Go durations ("10s", "1m", "1m30s") or bare
+    integer seconds. Returns whole seconds, or None when unparseable."""
+    raw = raw.strip().strip('"').strip()
+    if raw.isdigit():
+        return int(raw)
+    parts = re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", raw)
+    if not parts or "".join(n + u for n, u in parts) != raw:
         return None
+    scale = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+    return int(round(sum(float(n) * scale[u] for n, u in parts)))
 
-    # Only look at inputs.exec blocks that actually invoke UTM
-    blocks = re.split(r"^\s*\[\[", text, flags=re.MULTILINE)
-    for block in blocks:
-        if not block.startswith("inputs.exec"):
-            continue
-        if "ucs_traffic_monitor" not in block:
-            continue
-        match = re.search(r'^\s*interval\s*=\s*"(\d+)([smh])"',
-                          block, flags=re.MULTILINE)
-        if match:
-            value, unit = int(match.group(1)), match.group(2)
-            return value * {"s": 1, "m": 60, "h": 3600}[unit]
-    return None
+
+def read_telegraf_config(paths):
+    # type: (List[Path]) -> str
+    """Concatenate telegraf.conf and every *.conf under telegraf.d."""
+    chunks = []
+    for path in paths:
+        files = sorted(path.glob("*.conf")) if path.is_dir() else [path]
+        for conf in files:
+            try:
+                chunks.append(conf.read_text())
+            except OSError as exc:
+                print(f"  ! cannot read {conf}: {exc}", file=sys.stderr)
+    return "\n".join(chunks)
+
+
+def _section_interval(block):
+    # type: (str) -> Optional[int]
+    match = re.search(r'^\s*interval\s*=\s*("?)([^"\n#]+)\1',
+                      block, flags=re.MULTILINE)
+    return parse_duration(match.group(2)) if match else None
+
+
+def telegraf_exec_interval(paths):
+    # type: (List[Path]) -> Tuple[Optional[int], str]
+    """Effective interval of the inputs.exec block that runs this collector.
+
+    An inputs.exec block without its own `interval` inherits [agent].interval,
+    which itself defaults to 10s. Reporting "not found" in that case would
+    hide exactly the mismatch this tool exists to catch.
+    """
+    text = read_telegraf_config(paths)
+    if not text:
+        return None, "telegraf config not readable"
+
+    # Split on every table header, keeping the header with its body
+    sections = re.split(r"^(?=\s*\[)", text, flags=re.MULTILINE)
+    utm_blocks = [b for b in sections
+                  if re.match(r"\s*\[\[\s*inputs\.exec\s*\]\]", b)
+                  and "ucs_traffic_monitor" in b]
+    if not utm_blocks:
+        return None, "no inputs.exec block runs ucs_traffic_monitor"
+
+    own = _section_interval(utm_blocks[0])
+    if own is not None:
+        return own, "set on the inputs.exec block"
+
+    agent = [b for b in sections if re.match(r"\s*\[\s*agent\s*\]", b)]
+    inherited = _section_interval(agent[0]) if agent else None
+    if inherited is not None:
+        return inherited, "inherited from [agent]"
+    return TELEGRAF_DEFAULT_INTERVAL_S, "Telegraf default, nothing set"
 
 
 def dashboard_polling_interval(dashboard_json):
@@ -195,51 +231,50 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-i", "--input-file", type=Path, required=True,
-                        help="UTM input file (ucs_domains_group_*.txt)")
-    parser.add_argument("-t", "--telegraf-conf", type=Path,
-                        default=Path("/etc/telegraf/telegraf.conf"),
-                        help="telegraf.conf holding the inputs.exec block")
+    credsource.add_arguments(parser)
+    parser.add_argument("-t", "--telegraf-conf", type=Path, action="append",
+                        help="telegraf.conf or telegraf.d directory; repeatable "
+                             "(default: /etc/telegraf/telegraf.conf and "
+                             "/etc/telegraf/telegraf.d)")
     parser.add_argument("-d", "--dashboard", type=Path,
                         help="dashboard JSON carrying [[polling_interval]]")
     parser.add_argument("--no-ucs", action="store_true",
                         help="skip the UCS queries, report the local side only")
     args = parser.parse_args()
 
-    try:
-        domains = parse_domains(args.input_file)
-    except OSError as exc:
-        print(f"cannot read {args.input_file}: {exc}", file=sys.stderr)
-        return 2
-
-    if not domains:
-        print(f"no domains in {args.input_file}", file=sys.stderr)
-        return 2
-
-    telegraf_s = telegraf_exec_interval(args.telegraf_conf)
+    conf_paths = args.telegraf_conf or [
+        Path(p) for p in DEFAULT_TELEGRAF_PATHS if Path(p).exists()]
+    telegraf_s, telegraf_src = telegraf_exec_interval(conf_paths)
     dashboard_s = (dashboard_polling_interval(args.dashboard)
                    if args.dashboard else None)
 
     print(f"telegraf inputs.exec interval : "
-          f"{f'{telegraf_s}s' if telegraf_s else 'not found'}")
+          f"{f'{telegraf_s}s' if telegraf_s else 'not found'} ({telegraf_src})")
     print(f"dashboard [[polling_interval]]: "
-          f"{f'{dashboard_s}s' if dashboard_s else 'not checked'}")
+          f"{f'{dashboard_s}s' if dashboard_s else 'not checked (60s in the repo dashboards)'}")
 
     if args.no_ucs:
         print("\n--no-ucs: skipping the UCSM side. Run without it for the "
               "verdict that matters.")
         return 0
 
+    try:
+        domains = credsource.load(args)
+    except (credsource.CredentialError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     all_agreed = True
-    for host, user, password in domains:
+    for domain in domains:
         try:
-            policies = ucsm_policy_intervals(host, user, password)
+            policies = ucsm_policy_intervals(domain.host, domain.user,
+                                             domain.password)
         except Exception as exc:
-            print(f"\n{host}\n  ! query failed: {type(exc).__name__}: {exc}",
+            print(f"\n{domain.host}\n  ! query failed: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
             all_agreed = False
             continue
-        if not report_domain(host, policies, telegraf_s, dashboard_s):
+        if not report_domain(domain.host, policies, telegraf_s, dashboard_s):
             all_agreed = False
 
     if all_agreed:

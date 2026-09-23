@@ -55,8 +55,13 @@ senha dentro. Confirmado em execução ponta a ponta.
 os antigos:
 
 ```sh
-# 1. Confirmar o problema (H3)
-sudo strings /usr/local/telegraf/ucs_traffic_monitor_*.pickle | grep -i -A2 passw
+# 1. Confirmar o problema (H3) sem imprimir a senha
+#    (um `strings | grep passw` sempre casa com o NOME do atributo e ainda
+#    joga o valor na tela; esta ferramenta compara bytes e diz só sim/não)
+sudo -u telegraf python3 tools/check_pickle_exposure.py \
+    --env-file /etc/utm/creds.env /usr/local/telegraf/*.pickle      # modo env
+sudo -u telegraf python3 tools/check_pickle_exposure.py \
+    -i ucs_domains_group_1.txt /usr/local/telegraf/*.pickle         # modo arquivo
 
 # 2. Parar o telegraf antes de mexer
 sudo systemctl stop telegraf
@@ -97,11 +102,13 @@ Se divergirem, todo painel de banda está fora de escala pelo fator mostrado.
 **⚠️ Rodar na VM:**
 
 ```sh
-python3 tools/audit_stats_interval.py \
-    -i /usr/local/telegraf/ucs_domains_group_1.txt \
-    -t /etc/telegraf/telegraf.conf \
-    -d grafana/dashboards/domain_traffic.json
+python3 tools/audit_stats_interval.py --env-file /etc/utm/creds.env   # modo env
+python3 tools/audit_stats_interval.py -i ucs_domains_group_1.txt      # modo arquivo
 ```
+
+Lê `/etc/telegraf/telegraf.conf` e `telegraf.d/` por padrão. Se o bloco
+`inputs.exec` não declara `interval`, reporta o herdado do `[agent]` — ou o
+padrão de 10 s do Telegraf, que é justamente o caso que mais desalinha.
 
 Sai 0 se tudo bate, 1 se diverge. Com `--no-ucs` roda offline e reporta só
 o lado local.
@@ -166,6 +173,8 @@ Verificado: netmiko 4.2.0 e 4.3.0 falham no 3.13; 4.4.0 e 4.8.0 passam.
 `ucsmsdk` 0.9.27 importa sem problema.
 
 ## Verificação
+
+Roteiro completo para a VM, com coleta automática: [`VALIDACAO.md`](VALIDACAO.md).
 
 ```sh
 python3 tests/test_quick_fixes.py      # 16/16
